@@ -26,11 +26,14 @@
 //!     }
 //!     fn view(&self, frame: &mut Frame) {
 //!         let area = frame.area();
-//!         let inner = Block::bordered()
-//!             .title(" Counter ")
-//!             .render(frame.canvas(), area, frame.cell_w(), frame.cell_h(), frame.theme());
-//!         Paragraph::new(&format!("count: {}", self.count))
-//!             .render(frame.canvas(), inner, frame.cell_w(), frame.cell_h(), frame.theme());
+//!         let inner = frame.render_block(
+//!             Block::bordered().title(" Counter "),
+//!             area,
+//!         );
+//!         frame.render(
+//!             Paragraph::new(&format!("count: {}", self.count)),
+//!             inner,
+//!         );
 //!     }
 //! }
 //!
@@ -76,8 +79,33 @@ pub use app::{App, Cmd, Event, Frame, KeyCode, KeyEvent, KeyModifiers, MouseButt
 pub use layout::{CellRect, Rect as PixRect, ScreenLayout};
 pub use renderer::{Color as PixColor, DrawCmd, PixelCanvas, TextStyle, Theme};
 pub use widget::{
-    bar_text_y, center_text_x, Block, Borders, Cell, Constraint, Direction, Flex, Gauge, Layout,
-    List, ListItem, ListState, Paragraph, Row, StatefulWidget, Style, Table, TableState, Tabs,
+    bar_text_y,
+    center_text_x,
+    draw_bar,
+    draw_pane,
+    // Chrome drawing
+    BarBuilder,
+    BarItem,
+    Block,
+    Borders,
+    Cell,
+    Constraint,
+    Direction,
+    Flex,
+    Gauge,
+    Layout,
+    List,
+    ListItem,
+    ListState,
+    PaneOpts,
+    Paragraph,
+    Row,
+    SectionBuilder,
+    StatefulWidget,
+    Style,
+    Table,
+    TableState,
+    Tabs,
     Widget,
 };
 

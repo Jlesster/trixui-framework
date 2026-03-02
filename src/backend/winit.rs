@@ -86,11 +86,11 @@ impl<A: App> Handler<A> {
 
         let (cw, ch) = (self.renderer.cell_w, self.renderer.cell_h);
         let theme = self.app.theme();
-        let sl = ScreenLayout::new(vw, vh, cw, ch, 0);
+        let sl = ScreenLayout::new(vw, vh, 0);
         let mut canvas = PixelCanvas::new(vw, vh);
         canvas.set_clip(Some(sl.vp));
         {
-            let mut frame = Frame::new(&mut canvas, sl, &theme);
+            let mut frame = Frame::new_with_metrics(&mut canvas, sl, &theme, cw, ch);
             self.app.view(&mut frame);
         }
         let cmds = canvas.finish();
@@ -112,6 +112,10 @@ impl<A: App> Handler<A> {
                 self.do_cmd(next)
             }
             Cmd::Batch(v) => v.into_iter().any(|c| self.do_cmd(c)),
+            Cmd::Spawn(f) => {
+                std::thread::spawn(f);
+                false
+            }
         }
     }
 }
@@ -317,6 +321,10 @@ pub struct WinitBackend {
     size_px: f32,
     // For the Backend trait impl only — not used by run_app.
     pending: std::collections::VecDeque<RawInput>,
+    // Window configuration
+    title: String,
+    size: (u32, u32),
+    resizable: bool,
 }
 
 enum RawInput {
@@ -343,43 +351,40 @@ impl WinitBackend {
             font_data: font_data.to_vec(),
             size_px,
             pending: Default::default(),
+            title: "trixui".into(),
+            size: (1280, 800),
+            resizable: true,
         })
     }
 
-    /// Run the application. Blocks until quit.
-    ///
-    /// Creates the GL context and window on the first `Resumed` event (the
-    /// winit 0.30 lifecycle), then drives the app at `App::tick_rate()` Hz.
-    pub fn run_app<A: App>(self, mut app: A) -> crate::Result<()> {
-        let font_static: &'static [u8] = Box::leak(self.font_data.clone().into_boxed_slice());
+    /// Set the window title.
+    pub fn title(mut self, t: impl Into<String>) -> Self {
+        self.title = t.into();
+        self
+    }
+    /// Set the initial window size in logical pixels.
+    pub fn window_size(mut self, w: u32, h: u32) -> Self {
+        self.size = (w, h);
+        self
+    }
+    /// Set whether the window is user-resizable.
+    pub fn resizable(mut self, r: bool) -> Self {
+        self.resizable = r;
+        self
+    }
 
-        // Build a temporary event loop just to get display/config for the
-        // atlas — we need cell metrics before the first Resumed fires.
-        // Instead, build the atlas from font data directly (no GL needed).
+    /// Run the application. Blocks until quit.
+    pub fn run_app<A: App>(self, mut app: A) -> crate::Result<()> {
+        // No Box::leak — Shaper pins bytes internally via Pin<Box<[u8]>>.
         let atlas = GlyphAtlas::new(&self.font_data, None, None, self.size_px, 1.2)
             .map_err(|e| format!("GlyphAtlas: {e}"))?;
-        let shaper = Shaper::new(font_static);
-
-        // ChromeRenderer requires a current GL context. We can't create it
-        // until Resumed. Use a deferred init pattern: build the EventLoop,
-        // then create the renderer inside the first Resumed call.
-        //
-        // To keep the API simple we create a throwaway EventLoop here only
-        // for the display probe, create the renderer on its first Resumed,
-        // then run the real loop. Since glutin_winit creates the window
-        // inside DisplayBuilder::build (called in Resumed), we defer
-        // ChromeRenderer creation there too.
-        //
-        // The atlas cell metrics are available from GlyphAtlas before any
-        // GL calls — ChromeRenderer::new just uploads textures.
+        let shaper = Shaper::new(&self.font_data);
 
         let init_cmd = app.init();
 
         let event_loop = EventLoop::new()?;
         event_loop.set_control_flow(ControlFlow::Poll);
 
-        // We'll finish ChromeRenderer init inside the first `resumed` call.
-        // Smuggle the pre-built atlas + shaper via Option fields in a wrapper.
         let mut handler = HandlerBuilder {
             app,
             font_data: self.font_data,
@@ -388,12 +393,17 @@ impl WinitBackend {
             shaper: Some(shaper),
             gl_state: None,
             renderer: None,
-            tick_ns: 1_000_000_000u64 / 60, // updated in run after app.tick_rate()
+            tick_ns: 1_000_000_000u64 / 60,
             last_tick: std::time::Instant::now(),
             last_mouse: (0, 0),
             cur_mods: KeyModifiers::NONE,
             quit: false,
             init_cmd: Some(init_cmd),
+            held_key: None,
+            held_mouse_btn: None,
+            win_title: self.title,
+            win_size: self.size,
+            win_resizable: self.resizable,
         };
 
         event_loop.run_app(&mut handler)?;
@@ -417,6 +427,19 @@ struct HandlerBuilder<A: App> {
     cur_mods: KeyModifiers,
     quit: bool,
     init_cmd: Option<Cmd<A::Message>>,
+    /// Key-repeat tracking: (code, mods, initial_press_time, last_repeat_time)
+    held_key: Option<(
+        KeyCode,
+        KeyModifiers,
+        std::time::Instant,
+        std::time::Instant,
+    )>,
+    /// Mouse buttons currently held (for drag synthesis)
+    held_mouse_btn: Option<MouseButton>,
+    /// Window config
+    win_title: String,
+    win_size: (u32, u32),
+    win_resizable: bool,
 }
 
 impl<A: App> HandlerBuilder<A> {
@@ -433,6 +456,10 @@ impl<A: App> HandlerBuilder<A> {
                 self.do_cmd(next)
             }
             Cmd::Batch(v) => v.into_iter().any(|c| self.do_cmd(c)),
+            Cmd::Spawn(f) => {
+                std::thread::spawn(f);
+                false
+            }
         }
     }
 
@@ -451,11 +478,11 @@ impl<A: App> HandlerBuilder<A> {
 
         let (cw, ch) = (r.cell_w, r.cell_h);
         let theme = self.app.theme();
-        let sl = ScreenLayout::new(vw, vh, cw, ch, 0);
+        let sl = ScreenLayout::new(vw, vh, 0);
         let mut canvas = PixelCanvas::new(vw, vh);
         canvas.set_clip(Some(sl.vp));
         {
-            let mut frame = Frame::new(&mut canvas, sl, &theme);
+            let mut frame = Frame::new_with_metrics(&mut canvas, sl, &theme, cw, ch);
             self.app.view(&mut frame);
         }
         let cmds = canvas.finish();
@@ -476,9 +503,12 @@ impl<A: App> ApplicationHandler for HandlerBuilder<A> {
         }
 
         let win_attrs = winit::window::WindowAttributes::default()
-            .with_title("trixui")
-            .with_inner_size(winit::dpi::LogicalSize::new(1280u32, 800u32))
-            .with_resizable(true);
+            .with_title(self.win_title.as_str())
+            .with_inner_size(winit::dpi::LogicalSize::new(
+                self.win_size.0,
+                self.win_size.1,
+            ))
+            .with_resizable(self.win_resizable);
 
         let display_builder =
             glutin_winit::DisplayBuilder::new().with_window_attributes(Some(win_attrs));
@@ -556,6 +586,24 @@ impl<A: App> ApplicationHandler for HandlerBuilder<A> {
                 el.exit();
             }
 
+            WindowEvent::Focused(gained) => {
+                let ev = if gained {
+                    Event::FocusGained
+                } else {
+                    Event::FocusLost
+                };
+                let cmd = self.app.update(ev);
+                if self.do_cmd(cmd) {
+                    self.quit = true;
+                    el.exit();
+                }
+                if !gained {
+                    // Clear held key on focus loss to avoid phantom repeats.
+                    self.held_key = None;
+                    self.held_mouse_btn = None;
+                }
+            }
+
             WindowEvent::Resized(sz) => {
                 if let Some(gs) = self.gl_state.as_mut() {
                     if let (Some(nw), Some(nh)) = (
@@ -565,7 +613,6 @@ impl<A: App> ApplicationHandler for HandlerBuilder<A> {
                         gs.surface.resize(&gs.context, nw, nh);
                     }
                 }
-                // Split borrow: call update first, then do_cmd.
                 let cmd = self.app.update(Event::Resize(sz.width, sz.height));
                 if self.do_cmd(cmd) {
                     self.quit = true;
@@ -575,65 +622,118 @@ impl<A: App> ApplicationHandler for HandlerBuilder<A> {
 
             WindowEvent::ModifiersChanged(mods) => {
                 self.cur_mods = map_mods(mods.state());
+                // If modifiers change while a key is held, clear repeat state.
+                self.held_key = None;
             }
 
             WindowEvent::KeyboardInput { event: ke, .. } => {
-                if ke.state == ElementState::Pressed {
-                    if let Some(code) = map_key(&ke.logical_key) {
-                        let ev = Event::Key(KeyEvent::new(code, self.cur_mods));
-                        let cmd = self.app.update(ev);
-                        if self.do_cmd(cmd) {
-                            self.quit = true;
-                            el.exit();
+                match ke.state {
+                    ElementState::Pressed => {
+                        if let Some(code) = map_key(&ke.logical_key) {
+                            let now = std::time::Instant::now();
+                            // On a new press, reset repeat state.
+                            self.held_key = Some((code.clone(), self.cur_mods, now, now));
+                            let ev = Event::Key(KeyEvent::new(code, self.cur_mods));
+                            let cmd = self.app.update(ev);
+                            if self.do_cmd(cmd) {
+                                self.quit = true;
+                                el.exit();
+                            }
                         }
                     }
+                    ElementState::Released => {
+                        // Clear hold if the released key matches.
+                        if let Some(code) = map_key(&ke.logical_key) {
+                            if matches!(&self.held_key, Some((hk, _, _, _)) if *hk == code) {
+                                self.held_key = None;
+                            }
+                            let ev = Event::KeyUp(KeyEvent::new(code, self.cur_mods));
+                            self.app.update(ev);
+                        }
+                    }
+                    _ => {}
                 }
             }
 
             WindowEvent::CursorMoved { position, .. } => {
                 self.last_mouse = (position.x as u32, position.y as u32);
                 let (x, y) = self.last_mouse;
-                self.app.update(Event::Mouse(MouseEvent {
-                    kind: MouseEventKind::Moved,
-                    x,
-                    y,
-                    button: MouseButton::None,
-                }));
+                // Synthesise Drag if a button is held, Moved otherwise.
+                let (kind, button) = match &self.held_mouse_btn {
+                    Some(btn) => (MouseEventKind::Drag, btn.clone()),
+                    None => (MouseEventKind::Moved, MouseButton::None),
+                };
+                self.app
+                    .update(Event::Mouse(MouseEvent { kind, x, y, button }));
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
                 let (x, y) = self.last_mouse;
                 let btn = map_mouse_btn(button);
-                let kind = if state == ElementState::Pressed {
-                    MouseEventKind::Down
+                if state == ElementState::Pressed {
+                    self.held_mouse_btn = Some(btn.clone());
+                    let cmd = self.app.update(Event::Mouse(MouseEvent {
+                        kind: MouseEventKind::Down,
+                        x,
+                        y,
+                        button: btn,
+                    }));
+                    if self.do_cmd(cmd) {
+                        self.quit = true;
+                        el.exit();
+                    }
                 } else {
-                    MouseEventKind::Up
-                };
-                let cmd = self.app.update(Event::Mouse(MouseEvent {
-                    kind,
-                    x,
-                    y,
-                    button: btn,
-                }));
-                if self.do_cmd(cmd) {
-                    self.quit = true;
-                    el.exit();
+                    self.held_mouse_btn = None;
+                    let cmd = self.app.update(Event::Mouse(MouseEvent {
+                        kind: MouseEventKind::Up,
+                        x,
+                        y,
+                        button: btn,
+                    }));
+                    if self.do_cmd(cmd) {
+                        self.quit = true;
+                        el.exit();
+                    }
                 }
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
                 let (x, y) = self.last_mouse;
-                let kind = match delta {
-                    MouseScrollDelta::LineDelta(_, dy) if dy > 0.0 => MouseEventKind::ScrollUp,
-                    MouseScrollDelta::PixelDelta(p) if p.y > 0.0 => MouseEventKind::ScrollUp,
-                    _ => MouseEventKind::ScrollDown,
-                };
-                self.app.update(Event::Mouse(MouseEvent {
-                    kind,
-                    x,
-                    y,
-                    button: MouseButton::None,
-                }));
+                match delta {
+                    MouseScrollDelta::LineDelta(dx, dy) => {
+                        // Emit both a discrete kind and a precise scroll event.
+                        let kind = if dy > 0.0 {
+                            MouseEventKind::ScrollUp
+                        } else {
+                            MouseEventKind::ScrollDown
+                        };
+                        self.app.update(Event::Mouse(MouseEvent {
+                            kind,
+                            x,
+                            y,
+                            button: MouseButton::None,
+                        }));
+                        self.app.update(Event::Scroll { x: dx, y: dy });
+                    }
+                    MouseScrollDelta::PixelDelta(p) => {
+                        let kind = if p.y > 0.0 {
+                            MouseEventKind::ScrollUp
+                        } else {
+                            MouseEventKind::ScrollDown
+                        };
+                        self.app.update(Event::Mouse(MouseEvent {
+                            kind,
+                            x,
+                            y,
+                            button: MouseButton::None,
+                        }));
+                        self.app.update(Event::Scroll {
+                            x: p.x as f32,
+                            y: p.y as f32,
+                        });
+                    }
+                    _ => {}
+                }
             }
 
             WindowEvent::RedrawRequested => {
@@ -653,6 +753,27 @@ impl<A: App> ApplicationHandler for HandlerBuilder<A> {
         }
 
         let now = std::time::Instant::now();
+
+        // ── Key repeat ────────────────────────────────────────────────────────
+        const REPEAT_DELAY_MS: u128 = 300;
+        const REPEAT_INTERVAL_MS: u128 = 30;
+
+        if let Some((ref code, mods, press_t, ref mut last_r)) = self.held_key {
+            let elapsed_press = now.duration_since(press_t).as_millis();
+            let elapsed_last = now.duration_since(*last_r).as_millis();
+            if elapsed_press >= REPEAT_DELAY_MS && elapsed_last >= REPEAT_INTERVAL_MS {
+                *last_r = now;
+                let ev = Event::Key(KeyEvent::repeated(code.clone(), mods));
+                let cmd = self.app.update(ev);
+                if self.do_cmd(cmd) {
+                    self.quit = true;
+                    el.exit();
+                    return;
+                }
+            }
+        }
+
+        // ── Tick ──────────────────────────────────────────────────────────────
         if now.duration_since(self.last_tick).as_nanos() as u64 >= self.tick_ns {
             self.last_tick = now;
             let cmd = self.app.update(Event::Tick);

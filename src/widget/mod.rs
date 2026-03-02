@@ -21,8 +21,27 @@ use crate::renderer::{
 };
 use bitflags::bitflags;
 
+mod gl;
 mod layout_solver;
 pub use layout_solver::{Constraint, Direction, Flex, Layout};
+
+pub mod text_input;
+pub use text_input::{TextInput, TextInputState};
+
+pub mod spinner;
+pub use spinner::{Spinner, SpinnerState, SpinnerStyle};
+
+pub mod popup;
+pub use popup::Popup;
+
+pub mod scrollbar;
+pub use scrollbar::{Scrollbar, ScrollbarOrientation};
+
+pub mod title_bar;
+pub use title_bar::{TitleBar, TitleBarButtons, TitleBarHit};
+
+pub mod chrome;
+pub use chrome::{draw_bar, draw_pane, BarBuilder, BarItem, PaneOpts, SectionBuilder};
 
 pub const BORDER_PX: u32 = 1;
 
@@ -132,7 +151,7 @@ pub trait StatefulWidget {
 
 #[inline]
 pub fn bar_text_y(inner: Rect, cell_h: u32) -> u32 {
-    inner.y + inner.h.saturating_sub(cell_h) / 2
+    inner.y + (inner.h.saturating_sub(cell_h) / 2)
 }
 
 #[inline]
@@ -170,6 +189,15 @@ fn char_byte_limit(s: &str, max_chars: usize) -> usize {
 // Block
 // ══════════════════════════════════════════════════════════════════════════════
 
+/// Title alignment for [`Block`].
+#[derive(Debug, Clone, Copy, Default)]
+pub enum TitleAlignment {
+    #[default]
+    Left,
+    Center,
+    Right,
+}
+
 /// A bordered container with an optional title.
 pub struct Block<'a> {
     borders: Borders,
@@ -177,6 +205,7 @@ pub struct Block<'a> {
     style: Style,
     title: Option<&'a str>,
     title_style: Style,
+    title_align: TitleAlignment,
     border_px: u32,
     top_accent: Option<Color>,
     corner_radius: f32,
@@ -190,6 +219,7 @@ impl<'a> Block<'a> {
             style: Style::default(),
             title: None,
             title_style: Style::default(),
+            title_align: TitleAlignment::Left,
             border_px: BORDER_PX,
             top_accent: None,
             corner_radius: 0.0,
@@ -218,6 +248,10 @@ impl<'a> Block<'a> {
     }
     pub fn title_style(mut self, s: Style) -> Self {
         self.title_style = s;
+        self
+    }
+    pub fn title_alignment(mut self, a: TitleAlignment) -> Self {
+        self.title_align = a;
         self
     }
     pub fn border_px(mut self, px: u32) -> Self {
@@ -286,7 +320,17 @@ impl<'a> Block<'a> {
                 };
                 let pad = cell_w;
                 let max_w = area.w.saturating_sub((bp + pad) * 2);
-                canvas.text_maxw(area.x + bp + pad, area.y, title, ts, max_w);
+                let title_px = title.chars().count() as u32 * cell_w;
+                let tx = match self.title_align {
+                    TitleAlignment::Left => area.x + bp + pad,
+                    TitleAlignment::Center => {
+                        area.x + area.w.saturating_sub(title_px.min(max_w)) / 2
+                    }
+                    TitleAlignment::Right => {
+                        area.x + area.w.saturating_sub(bp + pad + title_px.min(max_w))
+                    }
+                };
+                canvas.text_maxw(tx, area.y, title, ts, max_w);
             }
         }
 

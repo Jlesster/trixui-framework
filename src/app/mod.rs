@@ -1,48 +1,28 @@
 //! app — App trait, event loop, Frame, Event, Cmd.
-//!
-//! The hybrid ratatui/bubbletea model:
-//!   - `App::view()` renders into `&mut Frame` (ratatui style)
-//!   - `App::update()` receives `Event<Msg>` and returns `Cmd<Msg>` (bubbletea style)
-//!
-//! # Rendering widgets
-//!
-//! The ergonomic path is `frame.render(widget, area)` which automatically
-//! threads `cell_w`, `cell_h`, and `theme` through for you:
-//!
-//! ```rust,ignore
-//! fn view(&self, frame: &mut Frame) {
-//!     let inner = frame.render_block(
-//!         Block::bordered().title(" My App "),
-//!         frame.area(),
-//!     );
-//!     frame.render(Paragraph::new("hello world"), inner);
-//!     frame.render_stateful(
-//!         List::new(self.items.clone()),
-//!         inner,
-//!         &mut self.list_state,
-//!     );
-//! }
-//! ```
 
-use crate::backend::Backend;
+use std::sync::Arc;
+
 use crate::layout::{Rect, ScreenLayout};
 use crate::renderer::{PixelCanvas, Theme};
-use crate::widget::{Block, StatefulWidget, Widget};
+use crate::widget::{
+    chrome::{draw_pane, BarBuilder, PaneOpts},
+    Block, StatefulWidget, Widget,
+};
 
 pub mod event;
 pub use event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent};
 
 // ── Cmd ───────────────────────────────────────────────────────────────────────
 
-/// An effect returned from `App::update`.
-pub enum Cmd<Msg> {
+pub enum Cmd<Msg: 'static> {
     None,
     Quit,
     Msg(Msg),
     Batch(Vec<Cmd<Msg>>),
+    Spawn(Box<dyn FnOnce() -> Msg + Send + 'static>),
 }
 
-impl<Msg> Cmd<Msg> {
+impl<Msg: 'static> Cmd<Msg> {
     pub fn none() -> Self {
         Self::None
     }
@@ -55,93 +35,106 @@ impl<Msg> Cmd<Msg> {
     pub fn batch(v: Vec<Cmd<Msg>>) -> Self {
         Self::Batch(v)
     }
+    pub fn spawn<F: FnOnce() -> Msg + Send + 'static>(f: F) -> Self {
+        Self::Spawn(Box::new(f))
+    }
 }
+
+pub(crate) type SpawnQueue<Msg> = Arc<std::sync::Mutex<std::collections::VecDeque<Msg>>>;
 
 // ── Frame ─────────────────────────────────────────────────────────────────────
 
 /// Render target passed to `App::view`.
 ///
-/// Use [`Frame::render`] / [`Frame::render_stateful`] for the cleanest API.
-/// The raw [`Frame::canvas`] accessor is still available for custom drawing.
+/// Pixel-only — no cell grid concepts here. Font metrics (`glyph_w`, `line_h`)
+/// are available for chrome drawing; TUI widget cell sizing is handled inside
+/// the Widget trait call-site.
 pub struct Frame<'a> {
     canvas: &'a mut PixelCanvas,
     layout: ScreenLayout,
     theme: &'a Theme,
+    /// Nominal glyph advance width in pixels (from the renderer font atlas).
+    /// Used by chrome drawing code to size borders and title padding.
+    pub glyph_w: u32,
+    /// Font line height in pixels (from the renderer font atlas).
+    /// Used by chrome drawing code to vertically centre text in bars/borders.
+    pub line_h: u32,
+    /// TUI cell width — passed to Widget::render. Same value as glyph_w for
+    /// monospace fonts; kept separate so the two uses stay explicit.
+    cell_w: u32,
+    /// TUI cell height — passed to Widget::render.
+    cell_h: u32,
+    regions: Vec<(String, Rect)>,
 }
 
 impl<'a> Frame<'a> {
-    pub fn new(canvas: &'a mut PixelCanvas, layout: ScreenLayout, theme: &'a Theme) -> Self {
+    /// Full constructor — supply all font metrics explicitly.
+    pub fn new_with_metrics(
+        canvas: &'a mut PixelCanvas,
+        layout: ScreenLayout,
+        theme: &'a Theme,
+        glyph_w: u32,
+        line_h: u32,
+    ) -> Self {
         Self {
             canvas,
             layout,
             theme,
+            glyph_w,
+            line_h,
+            // TUI cell dimensions are the same as glyph metrics for monospace.
+            cell_w: glyph_w,
+            cell_h: line_h,
+            regions: Vec::new(),
         }
+    }
+
+    /// Convenience constructor — equivalent to [`Frame::new_with_metrics`] but
+    /// with metrics inferred as `(0, 0)` for callers that don't need them.
+    ///
+    /// Prefer [`Frame::new_with_metrics`] when font metrics are available.
+    pub fn new(canvas: &'a mut PixelCanvas, layout: ScreenLayout, theme: &'a Theme) -> Self {
+        Self::new_with_metrics(canvas, layout, theme, 0, 0)
     }
 
     // ── Area accessors ────────────────────────────────────────────────────────
 
-    /// Full viewport rect.
     pub fn area(&self) -> Rect {
         self.layout.vp
     }
-
-    /// Content area (everything above the status bar).
     pub fn content_area(&self) -> Rect {
         self.layout.content
     }
-
-    /// Status bar rect.
     pub fn bar_area(&self) -> Rect {
         self.layout.bar
     }
-
     pub fn layout(&self) -> &ScreenLayout {
         &self.layout
     }
     pub fn theme(&self) -> &Theme {
         self.theme
     }
+    /// TUI cell width in pixels.
     pub fn cell_w(&self) -> u32 {
-        self.layout.cell_w
+        self.cell_w
     }
+    /// TUI cell height in pixels.
     pub fn cell_h(&self) -> u32 {
-        self.layout.cell_h
+        self.cell_h
     }
-
     /// Raw canvas — use when you need direct `DrawCmd` control.
     pub fn canvas(&mut self) -> &mut PixelCanvas {
         self.canvas
     }
 
-    // ── Ergonomic render helpers ──────────────────────────────────────────────
+    // ── TUI widget render helpers ─────────────────────────────────────────────
 
-    /// Render any [`Widget`] into `area`, threading cell metrics and theme
-    /// automatically.
-    ///
-    /// ```rust,ignore
-    /// frame.render(Paragraph::new("hello"), inner);
-    /// frame.render(Tabs::new(vec!["A","B"]).select(0), tab_area);
-    /// frame.render(Gauge::new().ratio(0.6), gauge_area);
-    /// ```
+    /// Render any [`Widget`] into `area`.
     pub fn render(&mut self, widget: impl Widget, area: Rect) {
-        widget.render(
-            self.canvas,
-            area,
-            self.layout.cell_w,
-            self.layout.cell_h,
-            self.theme,
-        );
+        widget.render(self.canvas, area, self.cell_w, self.cell_h, self.theme);
     }
 
     /// Render a [`StatefulWidget`] into `area`.
-    ///
-    /// ```rust,ignore
-    /// frame.render_stateful(
-    ///     List::new(items).highlight_style(Style::default().bg(t.highlight_bg)),
-    ///     list_area,
-    ///     &mut self.list_state,
-    /// );
-    /// ```
     pub fn render_stateful<W: StatefulWidget>(
         &mut self,
         widget: W,
@@ -152,93 +145,76 @@ impl<'a> Frame<'a> {
             self.canvas,
             area,
             state,
-            self.layout.cell_w,
-            self.layout.cell_h,
+            self.cell_w,
+            self.cell_h,
             self.theme,
         );
     }
 
     /// Render a [`Block`], returning the inner content [`Rect`].
-    ///
-    /// This is the idiomatic way to render a bordered panel:
-    ///
-    /// ```rust,ignore
-    /// let inner = frame.render_block(Block::bordered().title(" Pane "), area);
-    /// frame.render(Paragraph::new("content"), inner);
-    /// ```
     pub fn render_block(&mut self, block: Block<'_>, area: Rect) -> Rect {
-        block.render(
+        block.render(self.canvas, area, self.cell_w, self.cell_h, self.theme)
+    }
+
+    // ── Chrome helpers ────────────────────────────────────────────────────────
+
+    /// Draw a pane border + title in one call.
+    ///
+    /// All font metrics are supplied implicitly from the renderer.
+    /// See [`PaneOpts`] for the builder API.
+    pub fn draw_pane(&mut self, area: Rect, opts: PaneOpts) {
+        draw_pane(
             self.canvas,
             area,
-            self.layout.cell_w,
-            self.layout.cell_h,
+            &opts,
+            self.glyph_w,
+            self.line_h,
             self.theme,
-        )
+        );
+    }
+
+    /// Begin building a status bar for `area`.
+    ///
+    /// Chain `.left()`, `.center()`, `.right()`, then call `.finish()`.
+    pub fn bar(&mut self, area: Rect) -> BarBuilder<'_> {
+        BarBuilder::new(self.canvas, area, self.theme, self.glyph_w, self.line_h)
+    }
+
+    // ── Hit region API ────────────────────────────────────────────────────────
+
+    pub fn register_region(&mut self, name: impl Into<String>, area: Rect) {
+        self.regions.push((name.into(), area));
+    }
+
+    pub fn into_regions(self) -> Vec<(String, Rect)> {
+        self.regions
+    }
+
+    pub fn hit_test_regions(regions: &[(String, Rect)], x: u32, y: u32) -> Option<&str> {
+        regions.iter().rev().find_map(|(name, rect)| {
+            if x >= rect.x && x < rect.x + rect.w && y >= rect.y && y < rect.y + rect.h {
+                Some(name.as_str())
+            } else {
+                None
+            }
+        })
     }
 }
 
 // ── App trait ─────────────────────────────────────────────────────────────────
 
-/// Implement this to build a trixui application.
-///
-/// # Minimal example
-///
-/// ```rust,ignore
-/// use trixui::prelude::*;
-///
-/// struct MyApp { count: i32 }
-///
-/// impl App for MyApp {
-///     type Message = ();
-///
-///     fn update(&mut self, event: Event<()>) -> Cmd<()> {
-///         if let Event::Key(k) = event {
-///             match k.code {
-///                 KeyCode::Char('q') | KeyCode::Esc => return Cmd::quit(),
-///                 KeyCode::Up   => self.count += 1,
-///                 KeyCode::Down => self.count -= 1,
-///                 _ => {}
-///             }
-///         }
-///         Cmd::none()
-///     }
-///
-///     fn view(&self, frame: &mut Frame) {
-///         let inner = frame.render_block(
-///             Block::bordered().title(format!(" count: {} ", self.count).as_str()),
-///             frame.area(),
-///         );
-///         frame.render(
-///             Paragraph::new("↑/↓ to change, q to quit"),
-///             inner,
-///         );
-///     }
-/// }
-///
-/// fn main() -> trixui::Result<()> {
-///     WinitBackend::new()?.run_app(MyApp { count: 0 })
-/// }
-/// ```
 pub trait App: Sized + 'static {
-    type Message: 'static;
+    type Message: Send + 'static;
 
-    /// Process an event, return a command.
     fn update(&mut self, event: Event<Self::Message>) -> Cmd<Self::Message>;
-
-    /// Render the current state into `frame`.
     fn view(&self, frame: &mut Frame);
 
-    /// Called once before the event loop starts. Override for async init.
     fn init(&mut self) -> Cmd<Self::Message> {
         Cmd::none()
     }
-
-    /// Override to supply a custom theme. Called each frame.
     fn theme(&self) -> Theme {
         Theme::default()
     }
-
-    /// Target frame rate in Hz. Default 60.
     fn tick_rate(&self) -> u64 {
         60
     }
@@ -246,63 +222,56 @@ pub trait App: Sized + 'static {
 
 // ── Terminal ──────────────────────────────────────────────────────────────────
 
-/// Drives the event loop for backends that are not `WinitBackend`.
-///
-/// For `WinitBackend` (standalone windows) use `WinitBackend::run_app(app)`
-/// instead — winit owns its own event loop.
-///
-/// `Terminal` is the right choice for:
-/// - [`WaylandBackend`](crate::backend::wayland::WaylandBackend) inside a Smithay compositor
-/// - Custom test/headless backends
-pub struct Terminal<B: Backend> {
+pub struct Terminal<B: crate::backend::Backend> {
     backend: B,
+    spawn_queue: SpawnQueue<()>,
 }
 
-impl<B: Backend> Terminal<B> {
+impl<B: crate::backend::Backend> Terminal<B> {
     pub fn new(backend: B) -> crate::Result<Self> {
-        Ok(Self { backend })
+        Ok(Self {
+            backend,
+            spawn_queue: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+        })
     }
 
-    /// Run the app. Blocks until `Cmd::Quit` is returned.
-    ///
-    /// **Do not call this with `WinitBackend`** — use `WinitBackend::run_app()`
-    /// instead. The winit event loop cannot be driven from here.
     pub fn run<A: App>(mut self, mut app: A) -> crate::Result<()> {
+        let spawn_queue: SpawnQueue<A::Message> =
+            Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+
         let init_cmd = app.init();
-        if self.process_cmd(init_cmd, &mut app) {
+        if process_cmd_tree(init_cmd, &mut app, &spawn_queue) {
             return Ok(());
         }
 
-        let mut last = std::time::Instant::now();
+        let mut last_tick = std::time::Instant::now();
 
         'main: loop {
-            // Drain backend events
+            drain_spawn(&spawn_queue, &mut app);
+
             while let Some(ev) = self.backend.poll_event::<A::Message>() {
-                if self.process_cmd_from_event(ev, &mut app) {
+                if process_cmd_tree(app.update(ev), &mut app, &spawn_queue) {
                     break 'main;
                 }
             }
 
-            // Tick
             let tick_ns = 1_000_000_000u64 / app.tick_rate();
             let now = std::time::Instant::now();
-            if now.duration_since(last).as_nanos() as u64 >= tick_ns {
-                last = now;
-                let cmd = app.update(Event::Tick);
-                if self.process_cmd(cmd, &mut app) {
+            if now.duration_since(last_tick).as_nanos() as u64 >= tick_ns {
+                last_tick = now;
+                if process_cmd_tree(app.update(Event::Tick), &mut app, &spawn_queue) {
                     break 'main;
                 }
             }
 
-            // Render
             let (vp_w, vp_h) = self.backend.size();
             let (cell_w, cell_h) = self.backend.cell_size();
             let theme = app.theme();
-            let sl = ScreenLayout::new(vp_w, vp_h, cell_w, cell_h, 0);
+            let sl = ScreenLayout::new(vp_w, vp_h, 0);
             let mut canvas = PixelCanvas::new(vp_w, vp_h);
             canvas.set_clip(Some(sl.vp));
             {
-                let mut frame = Frame::new(&mut canvas, sl, &theme);
+                let mut frame = Frame::new_with_metrics(&mut canvas, sl, &theme, cell_w, cell_h);
                 app.view(&mut frame);
             }
             let cmds = canvas.finish();
@@ -311,26 +280,45 @@ impl<B: Backend> Terminal<B> {
 
         Ok(())
     }
+}
 
-    fn process_cmd_from_event<A: App>(&mut self, ev: Event<A::Message>, app: &mut A) -> bool {
-        let cmd = app.update(ev);
-        self.process_cmd(cmd, app)
-    }
+// ── Cmd processing helpers ────────────────────────────────────────────────────
 
-    /// Process a `Cmd` tree iteratively (no stack growth for deep batches).
-    fn process_cmd<A: App>(&mut self, root: Cmd<A::Message>, app: &mut A) -> bool {
-        let mut stack = vec![root];
-        while let Some(cmd) = stack.pop() {
-            match cmd {
-                Cmd::None => {}
-                Cmd::Quit => return true,
-                Cmd::Msg(m) => {
-                    let next = app.update(Event::Message(m));
-                    stack.push(next);
-                }
-                Cmd::Batch(v) => stack.extend(v),
+pub(crate) fn process_cmd_tree<A: App>(
+    root: Cmd<A::Message>,
+    app: &mut A,
+    spawn_queue: &SpawnQueue<A::Message>,
+) -> bool {
+    let mut stack = vec![root];
+    while let Some(cmd) = stack.pop() {
+        match cmd {
+            Cmd::None => {}
+            Cmd::Quit => return true,
+            Cmd::Msg(m) => {
+                let next = app.update(Event::Message(m));
+                stack.push(next);
+            }
+            Cmd::Batch(v) => stack.extend(v),
+            Cmd::Spawn(f) => {
+                let q = Arc::clone(spawn_queue);
+                std::thread::spawn(move || {
+                    let msg = f();
+                    if let Ok(mut guard) = q.lock() {
+                        guard.push_back(msg);
+                    }
+                });
             }
         }
-        false
+    }
+    false
+}
+
+pub(crate) fn drain_spawn<A: App>(spawn_queue: &SpawnQueue<A::Message>, app: &mut A) {
+    let msgs: Vec<A::Message> = {
+        let mut guard = spawn_queue.lock().unwrap();
+        guard.drain(..).collect()
+    };
+    for m in msgs {
+        app.update(Event::Message(m));
     }
 }

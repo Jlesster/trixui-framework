@@ -35,15 +35,15 @@
 //! ── PowerlineArrow + Powerline chars ─────────────────────────────────────────
 //! DrawCmd::PowerlineArrow emits directly to TriInst.
 //! U+E0B0–U+E0B3 inside Text strings are also converted to TriInst (TUI compat).
-
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::mem::size_of;
+use std::pin::Pin;
 
 use ab_glyph::{Font, FontRef, GlyphId, PxScale, ScaleFont};
 use rustybuzz::{Face, UnicodeBuffer};
 
-use super::{BorderSide, Color, CornerRadius, DrawCmd, PowerlineDir, TextStyle};
+use crate::renderer::{BorderSide, Color, CornerRadius, DrawCmd, PowerlineDir, TextStyle};
 
 // ═════════════════════════════════════════════════════════════════════════════
 // Shaders
@@ -58,7 +58,7 @@ uniform vec2 u_vp;
 out vec4 v_color;
 void main() {
     vec2 px  = i_rect.xy + a_pos * i_rect.zw;
-    vec2 ndc = (px / u_vp) * 2.0 - 1.0;
+    vec2 ndc = vec2((px.x / u_vp.x) * 2.0 - 1.0, (px.y / u_vp.y) * 2.0 - 1.0);
     gl_Position = vec4(ndc, 0.0, 1.0);
     v_color = i_color;
 }
@@ -108,7 +108,7 @@ out float v_strokew;
 
 void main() {
     vec2 px  = i_rect.xy + a_pos * i_rect.zw;
-    vec2 ndc = (px / u_vp) * 2.0 - 1.0;
+    vec2 ndc = vec2((px.x / u_vp.x) * 2.0 - 1.0, (px.y / u_vp.y) * 2.0 - 1.0);
     gl_Position = vec4(ndc, 0.0, 1.0);
     v_uv     = a_pos;
     v_size   = i_rect.zw;
@@ -195,7 +195,7 @@ out vec2 v_uv;
 out vec4 v_fg;
 void main() {
     vec2 px  = i_glyph.xy + a_pos * i_glyph.zw;
-    vec2 ndc = (px / u_vp) * 2.0 - 1.0;
+    vec2 ndc = vec2((px.x / u_vp.x) * 2.0 - 1.0, (px.y / u_vp.y) * 2.0 - 1.0);
     gl_Position = vec4(ndc, 0.0, 1.0);
     v_uv = mix(i_uv.xy, i_uv.zw, a_pos);
     v_fg = i_fg;
@@ -266,7 +266,7 @@ void main() {
         else                  pos = ba[gl_VertexID - 6];
     }
 
-    vec2 ndc = (pos / u_vp) * 2.0 - 1.0;
+    vec2 ndc = vec2((pos.x / u_vp.x) * 2.0 - 1.0, (pos.y / u_vp.y) * 2.0 - 1.0);
     gl_Position = vec4(ndc, 0.0, 1.0);
     v_color = i_color;
 }
@@ -360,23 +360,30 @@ struct IdKey {
 }
 
 struct OwnedFace {
-    _bytes: Vec<u8>,
+    _bytes: Pin<Box<[u8]>>,
     font: FontRef<'static>,
     scale: PxScale,
 }
 
 impl OwnedFace {
     fn new(data: Vec<u8>, scale: PxScale) -> Result<Self, String> {
-        let font: FontRef<'static> = unsafe {
-            let s: &[u8] = &data;
-            FontRef::try_from_slice(&*(s as *const [u8])).map_err(|e| format!("ab_glyph: {e}"))?
+        let pinned: Pin<Box<[u8]>> = Pin::new(data.into_boxed_slice());
+
+        let bytes_static: &'static [u8] = unsafe {
+            let ptr = pinned.as_ptr();
+            let len = pinned.len();
+            std::slice::from_raw_parts(ptr, len)
         };
+
+        let font = FontRef::try_from_slice(bytes_static).map_err(|e| format!("ab_glyph: {e}"))?;
+
         Ok(Self {
-            _bytes: data,
+            _bytes: pinned,
             font,
             scale,
         })
     }
+
     #[inline]
     fn scaled(&self) -> ab_glyph::PxScaleFont<&FontRef<'static>> {
         self.font.as_scaled(self.scale)
@@ -638,13 +645,24 @@ pub struct ShapedGlyph {
 }
 
 pub struct Shaper {
+    _bytes: Pin<Box<[u8]>>,
     face: Face<'static>,
 }
 
 impl Shaper {
-    pub fn new(font_data: &'static [u8]) -> Self {
+    pub fn new(font_data: &[u8]) -> Self {
+        let pinned: Pin<Box<[u8]>> = Pin::new(font_data.to_vec().into_boxed_slice());
+
+        let face = unsafe {
+            let ptr = pinned.as_ptr();
+            let len = pinned.len();
+            let s: &'static [u8] = std::slice::from_raw_parts(ptr, len);
+            Face::from_slice(s, 0).expect("rustybuzz: bad font")
+        };
+
         Self {
-            face: Face::from_slice(font_data, 0).expect("rustybuzz: bad font"),
+            _bytes: pinned,
+            face,
         }
     }
 
@@ -1280,7 +1298,9 @@ impl ChromeRenderer {
             gl::GetIntegerv(gl::SCISSOR_TEST, &mut scissor_enabled);
             let mut scissor = [0i32; 4];
             gl::GetIntegerv(gl::SCISSOR_BOX, scissor.as_mut_ptr());
-            eprintln!("GL viewport={vp:?} scissor_enabled={scissor_enabled} scissor={scissor:?}");
+            tracing::trace!(
+                "GL viewport={vp:?} scissor_enabled={scissor_enabled} scissor={scissor:?}"
+            );
             // ── Pass 1: BG quads ─────────────────────────────────────────────
             gl::UseProgram(self.bg_prog);
             gl::BindVertexArray(self.bg_vao);
