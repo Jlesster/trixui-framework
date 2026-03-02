@@ -11,6 +11,11 @@ pub trait Backend: Sized {
     /// Cell dimensions in pixels (from the font atlas).
     fn cell_size(&self) -> (u32, u32);
 
+    /// Actual ink height of glyphs (ascent + |descent| + line_gap).
+    /// Used by Frame to pass natural_h to BarBuilder for correct vertical centering.
+    /// Return 0 if not available (Frame will fall back to cell_h behaviour).
+    fn natural_h(&self) -> u32;
+
     /// Poll one pending input event, or return None if the queue is empty.
     fn poll_event<Msg: 'static>(&mut self) -> Option<Event<Msg>>;
 

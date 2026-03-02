@@ -435,6 +435,7 @@ pub struct BarBuilder<'frame> {
     left: Vec<BarItem>,
     center: Vec<BarItem>,
     right: Vec<BarItem>,
+    natural_h: u32,
 }
 
 impl<'frame> BarBuilder<'frame> {
@@ -445,6 +446,7 @@ impl<'frame> BarBuilder<'frame> {
         theme: &'frame Theme,
         glyph_w: u32,
         line_h: u32,
+        natural_h: u32,
     ) -> Self {
         Self {
             canvas,
@@ -458,6 +460,7 @@ impl<'frame> BarBuilder<'frame> {
             left: Vec::new(),
             center: Vec::new(),
             right: Vec::new(),
+            natural_h,
         }
     }
 
@@ -512,6 +515,7 @@ impl<'frame> BarBuilder<'frame> {
             self.glyph_w,
             self.line_h,
             self.theme,
+            self.natural_h,
             self.bg,
             self.sep_col,
             self.sep_top,
@@ -538,6 +542,7 @@ pub fn draw_bar(
     glyph_w: u32,
     line_h: u32,
     theme: &Theme,
+    natural_h: u32,
     bg_override: Color,
     sep_override: Color,
     sep_on_top: bool,
@@ -577,17 +582,17 @@ pub fn draw_bar(
 
     let mut x = rect.x;
     for item in left {
-        x = flush_item(canvas, item, rect, x, glyph_w, line_h, def_fg, def_sep);
+        x = flush_item(canvas, item, rect, x, glyph_w, natural_h, def_fg, def_sep);
     }
 
     let mut x = rect.x + rect.w.saturating_sub(center_w) / 2;
     for item in center {
-        x = flush_item(canvas, item, rect, x, glyph_w, line_h, def_fg, def_sep);
+        x = flush_item(canvas, item, rect, x, glyph_w, natural_h, def_fg, def_sep);
     }
 
     let mut x = rect.x + rect.w.saturating_sub(right_w);
     for item in right {
-        x = flush_item(canvas, item, rect, x, glyph_w, line_h, def_fg, def_sep);
+        x = flush_item(canvas, item, rect, x, glyph_w, natural_h, def_fg, def_sep);
     }
 }
 
@@ -598,7 +603,7 @@ fn flush_item(
     bar: Rect,
     mut x: u32,
     glyph_w: u32,
-    line_h: u32,
+    natural_h: u32,
     def_fg: Color,
     def_sep: Color,
 ) -> u32 {
@@ -612,7 +617,7 @@ fn flush_item(
         } else {
             item.sep_color
         };
-        canvas.vline(x, bar_text_y(bar, line_h), line_h, sc);
+        canvas.vline(x, bar_text_y(bar, natural_h), natural_h, sc); // ← both uses
         x += 1;
     }
 
@@ -627,7 +632,11 @@ fn flush_item(
     } else {
         item.fg
     };
-    let ty = bar_text_y(bar, line_h);
+    let ty = bar_text_y(bar, natural_h);
+    eprintln!(
+        "flush_item: bar.y={} bar.h={} natural_h={} ty={}",
+        bar.y, bar.h, natural_h, ty
+    );
 
     if !item.bg.is_transparent() {
         canvas.fill(x, bar.y, item_w, bar.h, item.bg);

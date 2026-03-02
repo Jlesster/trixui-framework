@@ -40,8 +40,8 @@ use std::ffi::CString;
 use std::mem::size_of;
 use std::pin::Pin;
 
-use ab_glyph::{Font, FontRef, GlyphId, PxScale, ScaleFont};
-use rustybuzz::{Face, UnicodeBuffer};
+use freetype::freetype as ft;
+use rustybuzz::{Face as HbFace, UnicodeBuffer};
 
 use crate::renderer::{BorderSide, Color, CornerRadius, DrawCmd, PowerlineDir, TextStyle};
 
@@ -58,7 +58,7 @@ uniform vec2 u_vp;
 out vec4 v_color;
 void main() {
     vec2 px  = i_rect.xy + a_pos * i_rect.zw;
-    vec2 ndc = (px / u_vp) * 2.0 - 1.0;
+    vec2 ndc = vec2((px.x / u_vp.x) * 2.0 - 1.0, (px.y / u_vp.y) * 2.0 - 1.0);
     gl_Position = vec4(ndc, 0.0, 1.0);
     v_color = i_color;
 }
@@ -71,26 +71,11 @@ out vec4 fragColor;
 void main() { fragColor = v_color; }
 "#;
 
-// ── RoundRect SDF ────────────────────────────────────────────────────────────
-//
-// Instance layout (96 bytes):
-//   vec4 i_rect     — (x, y, w, h) in pixels
-//   vec4 i_radii    — (tl, tr, bl, br) corner radii
-//   vec4 i_fill     — fill RGBA premultiplied
-//   vec4 i_stroke   — stroke RGBA premultiplied
-//   float i_strokew — stroke width in pixels
-//   float[3] _pad
-//
-// The vertex shader emits a full-rect quad in NDC. The fragment shader
-// computes the box-SDF in local (uv) space and discards/blends accordingly.
-
 const RRECT_VERT: &str = r#"#version 300 es
 precision highp float;
 
-// Per-vertex (quad template 0..5)
 in vec2 a_pos;
 
-// Per-instance
 in vec4 i_rect;
 in vec4 i_radii;
 in vec4 i_fill;
@@ -99,8 +84,8 @@ in float i_strokew;
 
 uniform vec2 u_vp;
 
-out vec2  v_uv;     // 0..1 across the rect
-out vec2  v_size;   // (w, h) in pixels — for SDF in pixel space
+out vec2  v_uv;
+out vec2  v_size;
 out vec4  v_radii;
 out vec4  v_fill;
 out vec4  v_stroke;
@@ -108,7 +93,7 @@ out float v_strokew;
 
 void main() {
     vec2 px  = i_rect.xy + a_pos * i_rect.zw;
-    vec2 ndc = (px / u_vp) * 2.0 - 1.0;
+    vec2 ndc = vec2((px.x / u_vp.x) * 2.0 - 1.0, (px.y / u_vp.y) * 2.0 - 1.0);
     gl_Position = vec4(ndc, 0.0, 1.0);
     v_uv     = a_pos;
     v_size   = i_rect.zw;
@@ -131,10 +116,6 @@ in float v_strokew;
 
 out vec4 fragColor;
 
-// Box SDF with per-corner radii.
-// p  — point in [-half_size .. +half_size] space
-// b  — half extents (w/2, h/2)
-// r  — radius for this quadrant
 float sdf_round_box(vec2 p, vec2 b, float r) {
     vec2 q = abs(p) - b + r;
     return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
@@ -142,11 +123,8 @@ float sdf_round_box(vec2 p, vec2 b, float r) {
 
 void main() {
     vec2 half_size = v_size * 0.5;
-    // Point in centred pixel space
     vec2 p = (v_uv - 0.5) * v_size;
 
-    // Pick radius for this quadrant
-    // v_radii = (tl, tr, bl, br)
     float r;
     if (p.x < 0.0 && p.y < 0.0) r = v_radii.x;
     else if (p.x >= 0.0 && p.y < 0.0) r = v_radii.y;
@@ -155,10 +133,8 @@ void main() {
 
     float d = sdf_round_box(p, half_size, r);
 
-    // Anti-alias width (1 px)
     float aa = fwidth(d);
 
-    // Outer edge alpha
     float outer = 1.0 - smoothstep(-aa, aa, d);
     if (outer < 0.001) discard;
 
@@ -195,7 +171,7 @@ out vec2 v_uv;
 out vec4 v_fg;
 void main() {
     vec2 px  = i_glyph.xy + a_pos * i_glyph.zw;
-    vec2 ndc = (px / u_vp) * 2.0 - 1.0;
+    vec2 ndc = vec2((px.x / u_vp.x) * 2.0 - 1.0, (px.y / u_vp.y) * 2.0 - 1.0);
     gl_Position = vec4(ndc, 0.0, 1.0);
     v_uv = mix(i_uv.xy, i_uv.zw, a_pos);
     v_fg = i_fg;
@@ -266,7 +242,7 @@ void main() {
         else                  pos = ba[gl_VertexID - 6];
     }
 
-    vec2 ndc = (pos / u_vp) * 2.0 - 1.0;
+    vec2 ndc = vec2((pos.x / u_vp.x) * 2.0 - 1.0, (pos.y / u_vp.y) * 2.0 - 1.0);
     gl_Position = vec4(ndc, 0.0, 1.0);
     v_color = i_color;
 }
@@ -293,10 +269,10 @@ struct BgInst {
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct RRectInst {
-    rect: [f32; 4],   // x, y, w, h
-    radii: [f32; 4],  // tl, tr, bl, br
-    fill: [f32; 4],   // premultiplied RGBA
-    stroke: [f32; 4], // premultiplied RGBA
+    rect: [f32; 4],
+    radii: [f32; 4],
+    fill: [f32; 4],
+    stroke: [f32; 4],
     strokew: f32,
     _pad: [f32; 3],
 }
@@ -309,7 +285,6 @@ struct GlyphInst {
     fg: [f32; 4],
 }
 
-/// Powerline triangle instance (filled arrows: 3 verts; chevrons: 12 verts).
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct TriInst {
@@ -326,12 +301,25 @@ const QUAD: [f32; 12] = [
 ];
 
 // ═════════════════════════════════════════════════════════════════════════════
-// GlyphAtlas
+// GlyphAtlas  (FreeType-backed — servo freetype crate: freetype::freetype::*)
 // ═════════════════════════════════════════════════════════════════════════════
+//
+// Cargo.toml:  freetype = "0.7"   (servo/rust-freetype — raw FFI bindings)
+//              Remove freetype-rs if present (conflicts with the above).
+//
+// All types live under `freetype::freetype::*`.
+// All metrics from FT_Size_Metrics are in 26.6 fixed-point → >> 6 for pixels.
+// bitmap_top / bitmap_left from FT_GlyphSlotRec are plain integers.
 
 pub const ATLAS_DIM: u32 = 2048;
 const ATLAS_GAP: u32 = 1;
 
+/// One cached glyph entry.
+///
+/// `bearing_y` = FreeType `bitmap_top` — pixels above baseline, positive up.
+/// Placement (kitty freetype.c):
+///   `gx = pen_x + bearing_x`
+///   `gy = cell_top + ascender - bearing_y`
 #[derive(Clone, Copy, Debug)]
 pub struct GlyphUv {
     pub uv_x: f32,
@@ -340,9 +328,9 @@ pub struct GlyphUv {
     pub uv_h: f32,
     pub width: u32,
     pub height: u32,
-    pub bearing_x: i32,
-    pub bearing_y: i32,
-    pub advance: u32,
+    pub bearing_x: i32, // FT bitmap_left  — pen → left edge, pixels
+    pub bearing_y: i32, // FT bitmap_top   — baseline → top, positive up
+    pub advance: u32,   // hori advance, pixels (26.6 >> 6)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -354,51 +342,118 @@ struct CharKey {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct IdKey {
-    id: u16,
+    id: u32,
     bold: bool,
     italic: bool,
 }
 
-struct OwnedFace {
-    _bytes: Pin<Box<[u8]>>,
-    font: FontRef<'static>,
-    scale: PxScale,
+// ── FreeType face wrapper ─────────────────────────────────────────────────
+
+struct FtFace {
+    _bytes: Pin<Box<[u8]>>, // font data; must outlive `face`
+    face: ft::FT_Face,      // *mut FT_FaceRec_; non-null while alive
 }
 
-impl OwnedFace {
-    fn new(data: Vec<u8>, scale: PxScale) -> Result<Self, String> {
-        let pinned: Pin<Box<[u8]>> = Pin::new(data.into_boxed_slice());
+// Safety: FT_Face is an opaque pointer.  We never share it across threads.
+unsafe impl Send for FtFace {}
 
-        let bytes_static: &'static [u8] = unsafe {
-            let ptr = pinned.as_ptr();
-            let len = pinned.len();
-            std::slice::from_raw_parts(ptr, len)
+impl FtFace {
+    fn new(lib: ft::FT_Library, data: &[u8], size_px: f32) -> Result<Self, String> {
+        let pinned: Pin<Box<[u8]>> = Pin::new(data.to_vec().into_boxed_slice());
+        let mut face: ft::FT_Face = std::ptr::null_mut();
+        let err = unsafe {
+            ft::FT_New_Memory_Face(
+                lib,
+                pinned.as_ptr(),
+                pinned.len() as ft::FT_Long,
+                0,
+                &mut face,
+            )
         };
-
-        let font = FontRef::try_from_slice(bytes_static).map_err(|e| format!("ab_glyph: {e}"))?;
-
+        if err != 0 || face.is_null() {
+            return Err(format!("FT_New_Memory_Face error {err}"));
+        }
+        // FT_Set_Pixel_Sizes: 1 EM = size_px device pixels (no DPI arithmetic).
+        let err = unsafe { ft::FT_Set_Pixel_Sizes(face, 0, size_px.round() as ft::FT_UInt) };
+        if err != 0 {
+            return Err(format!("FT_Set_Pixel_Sizes error {err}"));
+        }
         Ok(Self {
             _bytes: pinned,
-            font,
-            scale,
+            face,
         })
     }
 
-    #[inline]
-    fn scaled(&self) -> ab_glyph::PxScaleFont<&FontRef<'static>> {
-        self.font.as_scaled(self.scale)
+    /// `size->metrics.ascender >> 6`  — kitty: baseline = ascender in pixels
+    fn ascender_px(&self) -> i32 {
+        let m = self.size_metrics();
+        (m.ascender >> 6) as i32
+    }
+
+    /// `size->metrics.height >> 6`  — kitty: cell_height
+    fn cell_height_px(&self) -> u32 {
+        let m = self.size_metrics();
+        (m.height >> 6) as u32
+    }
+
+    /// `size->metrics.max_advance >> 6`
+    fn max_advance_px(&self) -> u32 {
+        let m = self.size_metrics();
+        (m.max_advance >> 6) as u32
+    }
+
+    /// `face->units_per_EM` — authoritative EM size in design units
+    fn units_per_em(&self) -> u32 {
+        unsafe { (*self.face).units_per_EM as u32 }
+    }
+
+    fn size_metrics(&self) -> &ft::FT_Size_Metrics_ {
+        unsafe { &(*(*self.face).size).metrics }
     }
 }
 
-/// 2048×2048 RGBA8 glyph atlas.
-///
-/// Box-drawing (U+2500–U+257F), block elements (U+2580–U+259F), and Powerline
-/// arrows (U+E0B0–U+E0B3) are **not** loaded here — they are rendered as native
-/// GL geometry. Braille (U+2800–U+28FF) still uses the atlas.
+impl Drop for FtFace {
+    fn drop(&mut self) {
+        if !self.face.is_null() {
+            unsafe {
+                ft::FT_Done_Face(self.face);
+            }
+        }
+    }
+}
+
+// ── FreeType library wrapper ──────────────────────────────────────────────
+
+struct FtLib(ft::FT_Library);
+unsafe impl Send for FtLib {}
+impl FtLib {
+    fn init() -> Result<Self, String> {
+        let mut lib: ft::FT_Library = std::ptr::null_mut();
+        let err = unsafe { ft::FT_Init_FreeType(&mut lib) };
+        if err != 0 || lib.is_null() {
+            return Err(format!("FT_Init_FreeType error {err}"));
+        }
+        Ok(Self(lib))
+    }
+}
+impl Drop for FtLib {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                ft::FT_Done_FreeType(self.0);
+            }
+        }
+    }
+}
+
+// ── GlyphAtlas ───────────────────────────────────────────────────────────────
+
+/// 2048×2048 RGBA8 texture atlas rasterised by FreeType.
 pub struct GlyphAtlas {
-    regular: OwnedFace,
-    bold: Option<OwnedFace>,
-    italic: Option<OwnedFace>,
+    _lib: FtLib,
+    regular: FtFace,
+    bold: Option<FtFace>,
+    italic: Option<FtFace>,
 
     char_cache: HashMap<CharKey, Option<GlyphUv>>,
     id_cache: HashMap<IdKey, Option<GlyphUv>>,
@@ -422,38 +477,84 @@ impl GlyphAtlas {
         size_px: f32,
         _line_spacing: f32,
     ) -> Result<Self, String> {
-        let scale = PxScale::from(size_px);
-        let regular = OwnedFace::new(regular_data.to_vec(), scale)?;
+        let lib = FtLib::init()?;
+        let regular = FtFace::new(lib.0, regular_data, size_px)?;
         let bold = bold_data
-            .map(|d| OwnedFace::new(d.to_vec(), scale))
-            .transpose()
-            .unwrap_or(None);
+            .map(|d| FtFace::new(lib.0, d, size_px))
+            .transpose()?;
         let italic = italic_data
-            .map(|d| OwnedFace::new(d.to_vec(), scale))
-            .transpose()
-            .unwrap_or(None);
+            .map(|d| FtFace::new(lib.0, d, size_px))
+            .transpose()?;
 
-        let sf = regular.scaled();
-        let natural_h = (sf.ascent() + sf.descent().abs() + sf.line_gap()).ceil() as u32;
-        let cell_h = (natural_h + 3).max(1);
-        let ascender = sf.ascent().ceil() as i32;
-        let cell_w = {
-            let id = sf.font.glyph_id('0');
-            let adv = sf.h_advance(id).ceil() as u32;
-            if adv > 0 {
-                adv
+        // ── Cell metrics from FT_Size_Metrics (kitty set_font_size) ──────────
+        let ascender = regular.ascender_px();
+        let mut cell_h = regular.cell_height_px();
+
+        // kitty get_height_for_char('_'): grow cell_h if underscore overflows
+        unsafe {
+            let idx = ft::FT_Get_Char_Index(regular.face, '_' as ft::FT_ULong);
+            if idx != 0 && ft::FT_Load_Glyph(regular.face, idx, ft::FT_LOAD_RENDER as i32) == 0 {
+                let slot = (*regular.face).glyph;
+                let btop = (*slot).bitmap_top; // FT_Int (i32)
+                let brows = (*slot).bitmap.rows; // u32
+                if btop <= 0 || (btop > 0 && btop < ascender) {
+                    let candidate = (ascender - btop) as u32 + brows;
+                    if candidate > cell_h {
+                        tracing::warn!(
+                            "GlyphAtlas: growing cell_h {} → {} for underscore",
+                            cell_h,
+                            candidate
+                        );
+                        cell_h = candidate;
+                    }
+                }
+            }
+        }
+        let cell_h = cell_h.max(1);
+        let natural_h = cell_h;
+
+        // ── Cell width ───────────────────────────────────────────────────────
+        // cell_w = advance of '0' (digit zero) — canonical monospace cell width,
+        // matching kitty and the old ab_glyph path (h_advance('0')).
+        // Falls back to space advance, then max_advance only as last resort.
+        let cell_w = unsafe {
+            let zero_adv = {
+                let idx = ft::FT_Get_Char_Index(regular.face, '0' as ft::FT_ULong);
+                if idx != 0 && ft::FT_Load_Glyph(regular.face, idx, ft::FT_LOAD_DEFAULT as i32) == 0
+                {
+                    ((*(*regular.face).glyph).advance.x >> 6) as u32
+                } else {
+                    0
+                }
+            };
+            let space_adv = {
+                let idx = ft::FT_Get_Char_Index(regular.face, ' ' as ft::FT_ULong);
+                if idx != 0 && ft::FT_Load_Glyph(regular.face, idx, ft::FT_LOAD_DEFAULT as i32) == 0
+                {
+                    ((*(*regular.face).glyph).advance.x >> 6) as u32
+                } else {
+                    0
+                }
+            };
+            if zero_adv > 0 {
+                zero_adv
+            } else if space_adv > 0 {
+                space_adv
             } else {
-                let sid = sf.font.glyph_id(' ');
-                (sf.h_advance(sid).ceil() as u32).max(size_px as u32)
+                regular.max_advance_px()
             }
         }
         .max(4);
 
         tracing::info!(
-            "GlyphAtlas {size_px:.1}px cell={cell_w}×{cell_h} natural={natural_h} asc={ascender}"
+            "GlyphAtlas FreeType  size_px={size_px}  ppem={}  \
+             cell={cell_w}×{cell_h}  baseline={ascender}  upm={}",
+            regular.size_metrics().y_ppem,
+            regular.units_per_em(),
         );
 
         let mut atlas = Self {
+            _lib: lib,
             regular,
             bold,
             italic,
@@ -463,9 +564,9 @@ impl GlyphAtlas {
             cursor_x: 0,
             cursor_y: 0,
             row_h: 0,
-            natural_h,
             cell_w,
             cell_h,
+            natural_h,
             ascender,
             dirty: true,
         };
@@ -483,61 +584,57 @@ impl GlyphAtlas {
         Ok(atlas)
     }
 
+    /// `units_per_EM` for HarfBuzz advance scaling.
+    pub fn units_per_em(&self) -> u32 {
+        self.regular.units_per_em()
+    }
+
     pub fn glyph(&mut self, ch: char, bold: bool, italic: bool) -> Option<GlyphUv> {
         let key = CharKey { ch, bold, italic };
         if let Some(&v) = self.char_cache.get(&key) {
             return v;
         }
-        let info = self.rasterise_char(ch, bold, italic);
-        self.char_cache.insert(key, info);
-        info
+        let v = self.render_char(ch, bold, italic);
+        self.char_cache.insert(key, v);
+        v
     }
 
-    pub fn glyph_by_id(&mut self, id: u16, bold: bool, italic: bool) -> Option<GlyphUv> {
+    pub fn glyph_by_id(&mut self, id: u32, bold: bool, italic: bool) -> Option<GlyphUv> {
         let key = IdKey { id, bold, italic };
         if let Some(&v) = self.id_cache.get(&key) {
             return v;
         }
-        let info = self.rasterise_by_id(id, bold, italic);
-        self.id_cache.insert(key, info);
-        info
+        let v = self.render_idx(id, self.pick_face(bold, italic));
+        self.id_cache.insert(key, v);
+        v
     }
 
-    fn rasterise_char(&mut self, ch: char, bold: bool, italic: bool) -> Option<GlyphUv> {
-        let fp = self.pick_face(bold, italic);
-        let id = unsafe { (*fp).scaled().font.glyph_id(ch) };
-        let fp = if id == GlyphId(0) && (bold || italic) {
-            &self.regular as *const _
-        } else {
-            fp
-        };
-        let id = unsafe { (*fp).scaled().font.glyph_id(ch) };
-        self.rasterise_from_ptr(id, fp)
-    }
-
-    fn rasterise_by_id(&mut self, id: u16, bold: bool, italic: bool) -> Option<GlyphUv> {
-        let fp = self.pick_face(bold, italic);
-        self.rasterise_from_ptr(GlyphId(id), fp)
-    }
-
-    fn pick_face(&self, bold: bool, italic: bool) -> *const OwnedFace {
+    fn pick_face(&self, bold: bool, italic: bool) -> ft::FT_Face {
         if bold && self.bold.is_some() {
-            self.bold.as_ref().unwrap()
+            self.bold.as_ref().unwrap().face
         } else if italic && self.italic.is_some() {
-            self.italic.as_ref().unwrap()
+            self.italic.as_ref().unwrap().face
         } else {
-            &self.regular
+            self.regular.face
         }
     }
 
-    fn rasterise_from_ptr(&mut self, glyph_id: GlyphId, fp: *const OwnedFace) -> Option<GlyphUv> {
-        let sf = unsafe { (*fp).scaled() };
-        let advance = sf.h_advance(glyph_id).ceil() as u32;
-        let glyph = glyph_id.with_scale_and_position(sf.scale, ab_glyph::point(0.0, sf.ascent()));
-        let outlined = sf.font.outline_glyph(glyph);
-        drop(sf);
+    fn render_char(&mut self, ch: char, bold: bool, italic: bool) -> Option<GlyphUv> {
+        let face = self.pick_face(bold, italic);
+        let idx = unsafe { ft::FT_Get_Char_Index(face, ch as ft::FT_ULong) };
+        // Fall back to regular face if glyph missing in bold/italic
+        let face = if idx == 0 && (bold || italic) {
+            self.regular.face
+        } else {
+            face
+        };
+        let idx2 = unsafe { ft::FT_Get_Char_Index(face, ch as ft::FT_ULong) };
+        self.render_idx(idx2, face)
+    }
 
-        let Some(outlined) = outlined else {
+    fn render_idx(&mut self, idx: u32, face: ft::FT_Face) -> Option<GlyphUv> {
+        let ok = unsafe { ft::FT_Load_Glyph(face, idx, ft::FT_LOAD_RENDER as i32) };
+        if ok != 0 {
             return Some(GlyphUv {
                 uv_x: 0.,
                 uv_y: 0.,
@@ -547,38 +644,46 @@ impl GlyphAtlas {
                 height: 0,
                 bearing_x: 0,
                 bearing_y: 0,
-                advance,
-            });
-        };
-
-        let bounds = outlined.px_bounds();
-        let w = bounds.width().ceil() as u32;
-        let h = bounds.height().ceil() as u32;
-        let bearing_x = bounds.min.x.floor() as i32;
-        let bearing_y = (-bounds.min.y).floor() as i32;
-
-        if w == 0 || h == 0 {
-            return Some(GlyphUv {
-                uv_x: 0.,
-                uv_y: 0.,
-                uv_w: 0.,
-                uv_h: 0.,
-                width: 0,
-                height: 0,
-                bearing_x,
-                bearing_y,
-                advance,
+                advance: 0,
             });
         }
 
-        let mut cov = vec![0u8; (w * h) as usize];
-        outlined.draw(|px, py, c| {
-            let i = (py * w + px) as usize;
-            if i < cov.len() {
-                cov[i] = (c * 255.0).round() as u8;
+        unsafe {
+            let slot = (*face).glyph;
+            // FreeType gives plain integer pixel values here:
+            let bearing_x = (*slot).bitmap_left; // i32
+            let bearing_y = (*slot).bitmap_top; // i32, positive up
+            let advance = ((*slot).advance.x >> 6) as u32; // 26.6 → px
+            let bm = &(*slot).bitmap;
+            let w = bm.width;
+            let h = bm.rows;
+
+            if w == 0 || h == 0 {
+                return Some(GlyphUv {
+                    uv_x: 0.,
+                    uv_y: 0.,
+                    uv_w: 0.,
+                    uv_h: 0.,
+                    width: 0,
+                    height: 0,
+                    bearing_x,
+                    bearing_y,
+                    advance,
+                });
             }
-        });
-        self.blit(cov, w, h, bearing_x, bearing_y, advance)
+
+            // Copy greyscale coverage, respecting FT's row pitch
+            let pitch = bm.pitch.unsigned_abs() as u32;
+            let buf = std::slice::from_raw_parts(bm.buffer, (h * pitch) as usize);
+            let mut cov = vec![0u8; (w * h) as usize];
+            for row in 0..h {
+                let src = &buf[(row * pitch) as usize..(row * pitch + w) as usize];
+                let dst = &mut cov[(row * w) as usize..(row * w + w) as usize];
+                dst.copy_from_slice(src);
+            }
+
+            self.blit(cov, w, h, bearing_x, bearing_y, advance)
+        }
     }
 
     fn blit(
@@ -601,23 +706,23 @@ impl GlyphAtlas {
             return None;
         }
         let stride = ATLAS_DIM as usize;
-        for py in 0..h {
-            for px in 0..w {
-                let src = bitmap[(py * w + px) as usize];
+        for row in 0..h {
+            for col in 0..w {
+                let a = bitmap[(row * w + col) as usize];
                 let base =
-                    ((self.cursor_y + py) as usize * stride + (self.cursor_x + px) as usize) * 4;
+                    ((self.cursor_y + row) as usize * stride + (self.cursor_x + col) as usize) * 4;
                 self.pixels[base] = 0xFF;
                 self.pixels[base + 1] = 0xFF;
                 self.pixels[base + 2] = 0xFF;
-                self.pixels[base + 3] = src;
+                self.pixels[base + 3] = a;
             }
         }
         let inset = 0.5 / ATLAS_DIM as f32;
         let uv = GlyphUv {
             uv_x: self.cursor_x as f32 / ATLAS_DIM as f32 + inset,
-            uv_y: self.cursor_y as f32 / ATLAS_DIM as f32 - inset,
-            uv_w: w as f32 / ATLAS_DIM as f32 - inset * 2.0,
-            uv_h: -(h as f32 / ATLAS_DIM as f32 - inset * 2.0),
+            uv_y: self.cursor_y as f32 / ATLAS_DIM as f32 + inset,
+            uv_w: w as f32 / ATLAS_DIM as f32 - 2.0 * inset,
+            uv_h: h as f32 / ATLAS_DIM as f32 - 2.0 * inset,
             width: w,
             height: h,
             bearing_x,
@@ -634,32 +739,28 @@ impl GlyphAtlas {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Shaper
+// Shaper  (rustybuzz, glyph_id promoted to u32)
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[derive(Debug, Clone)]
 pub struct ShapedGlyph {
-    pub glyph_id: u16,
+    pub glyph_id: u32, // FT glyph index
     pub cluster_width: usize,
-    pub advance_px: f32,
+    pub advance_px: f32, // HarfBuzz x_advance in font design units
 }
 
 pub struct Shaper {
     _bytes: Pin<Box<[u8]>>,
-    face: Face<'static>,
+    face: HbFace<'static>,
 }
 
 impl Shaper {
     pub fn new(font_data: &[u8]) -> Self {
         let pinned: Pin<Box<[u8]>> = Pin::new(font_data.to_vec().into_boxed_slice());
-
         let face = unsafe {
-            let ptr = pinned.as_ptr();
-            let len = pinned.len();
-            let s: &'static [u8] = std::slice::from_raw_parts(ptr, len);
-            Face::from_slice(s, 0).expect("rustybuzz: bad font")
+            let s: &'static [u8] = std::slice::from_raw_parts(pinned.as_ptr(), pinned.len());
+            HbFace::from_slice(s, 0).expect("rustybuzz: invalid font")
         };
-
         Self {
             _bytes: pinned,
             face,
@@ -684,7 +785,7 @@ impl Shaper {
                     .unwrap_or(text.len());
                 let cw = text[cb..nb].chars().count().max(1);
                 ShapedGlyph {
-                    glyph_id: infos[i].glyph_id as u16,
+                    glyph_id: infos[i].glyph_id,
                     cluster_width: cw,
                     advance_px: positions[i].x_advance as f32,
                 }
@@ -694,7 +795,7 @@ impl Shaper {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Codepoint classification helpers (TUI compat — Text path only)
+// Codepoint classification helpers
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[inline]
@@ -737,7 +838,7 @@ fn run_is_atlas_synthetic(text: &str) -> bool {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Box-drawing geometry (TUI compat — called only from Text path)
+// Box-drawing geometry
 // ═════════════════════════════════════════════════════════════════════════════
 
 fn box_to_lines(ch: char, cell_x: u32, cell_y: u32, cw: u32, ch_: u32) -> Vec<[f32; 4]> {
@@ -838,7 +939,6 @@ fn premul(c: [f32; 4]) -> [f32; 4] {
     [c[0] * c[3], c[1] * c[3], c[2] * c[3], c[3]]
 }
 
-/// Convert a `Color` to a premultiplied f32 array.
 #[inline]
 fn color_premul(c: Color) -> [f32; 4] {
     premul(c.to_f32())
@@ -855,7 +955,6 @@ pub struct ChromeRenderer {
     bg_ivbo: u32,
     bg_cap: usize,
 
-    // ── RoundRect SDF pass ───────────────────────────────────────────────────
     rrect_prog: u32,
     rrect_vao: u32,
     rrect_ivbo: u32,
@@ -881,6 +980,7 @@ pub struct ChromeRenderer {
 
     pub cell_w: u32,
     pub cell_h: u32,
+    pub natural_h: u32, // ← exposed so Frame/backends can pass it to bar_text_y
     ascender: i32,
 }
 
@@ -888,13 +988,21 @@ impl ChromeRenderer {
     pub fn new(
         atlas: GlyphAtlas,
         shaper: Shaper,
-        hb_units_per_em: f32,
+        _hb_units_per_em: f32, // ignored — read from FT face via atlas.units_per_em()
         size_px: f32,
     ) -> Result<Self, String> {
         let cell_w = atlas.cell_w;
         let cell_h = atlas.cell_h;
+        let natural_h = atlas.natural_h;
         let ascender = atlas.ascender;
-        let hb_scale = size_px / hb_units_per_em;
+        // HarfBuzz x_advance is in font design units.
+        // hb_scale converts design units → pixels: advance_px = advance_du * hb_scale
+        let upm = atlas.units_per_em() as f32;
+        let hb_scale = if upm > 0.0 {
+            size_px / upm
+        } else {
+            size_px / 1000.0
+        };
 
         let bg_prog = unsafe { compile_prog(BG_VERT, BG_FRAG)? };
         let rrect_prog = unsafe { compile_prog(RRECT_VERT, RRECT_FRAG)? };
@@ -934,6 +1042,7 @@ impl ChromeRenderer {
             hb_scale,
             cell_w,
             cell_h,
+            natural_h,
             ascender,
         })
     }
@@ -952,7 +1061,6 @@ impl ChromeRenderer {
 
         for cmd in cmds {
             match cmd {
-                // ── Solid rects & lines ──────────────────────────────────────
                 DrawCmd::FillRect { x, y, w, h, color } => {
                     if !color.is_transparent() {
                         bg_cpu.push(BgInst {
@@ -989,8 +1097,6 @@ impl ChromeRenderer {
                     });
                 }
 
-                // ── BorderLine primitive ──────────────────────────────────────
-                // Decomposed to BgInst rects — one per enabled side.
                 DrawCmd::BorderLine {
                     x,
                     y,
@@ -1032,7 +1138,6 @@ impl ChromeRenderer {
                     }
                 }
 
-                // ── RoundRect (SDF pass) ──────────────────────────────────────
                 DrawCmd::RoundRect {
                     x,
                     y,
@@ -1056,7 +1161,6 @@ impl ChromeRenderer {
                     });
                 }
 
-                // ── PowerlineArrow (explicit primitive) ───────────────────────
                 DrawCmd::PowerlineArrow {
                     x,
                     y,
@@ -1078,7 +1182,6 @@ impl ChromeRenderer {
                     }
                 }
 
-                // ── Text (TUI compat) ─────────────────────────────────────────
                 DrawCmd::Text {
                     x,
                     y,
@@ -1086,7 +1189,6 @@ impl ChromeRenderer {
                     style,
                     max_w,
                 } => {
-                    // Background rect
                     if !style.bg.is_transparent() {
                         let est_w = text.chars().count() as u32 * self.cell_w;
                         let bw = max_w.map(|m| m.min(est_w)).unwrap_or(est_w);
@@ -1106,7 +1208,6 @@ impl ChromeRenderer {
                         continue;
                     }
 
-                    // Per-character dispatch (TUI compat: box-draw / Powerline chars in text)
                     let fg = style.fg.to_f32();
                     let max_px = max_w.map(|m| m as i64);
                     let mut px_off: i64 = 0;
@@ -1272,7 +1373,6 @@ impl ChromeRenderer {
             }
         }
 
-        // Upload atlas patch if new glyphs were rasterised this frame.
         if self.atlas.dirty {
             unsafe {
                 patch_atlas_tex(self.atlas_tex, &self.atlas);
@@ -1282,8 +1382,6 @@ impl ChromeRenderer {
 
         let (vw, vh) = (vp_w as f32, vp_h as f32);
         unsafe {
-            // Own the viewport — the DRM compositor may have left it at the
-            // raw output size, which won't match vp_w/vp_h after snapping.
             gl::Viewport(0, 0, vp_w as i32, vp_h as i32);
             gl::Enable(gl::BLEND);
             gl::BlendFuncSeparate(
@@ -1292,16 +1390,7 @@ impl ChromeRenderer {
                 gl::ONE,
                 gl::ONE_MINUS_SRC_ALPHA,
             );
-            let mut vp = [0i32; 4];
-            gl::GetIntegerv(gl::VIEWPORT, vp.as_mut_ptr());
-            let mut scissor_enabled = 0i32;
-            gl::GetIntegerv(gl::SCISSOR_TEST, &mut scissor_enabled);
-            let mut scissor = [0i32; 4];
-            gl::GetIntegerv(gl::SCISSOR_BOX, scissor.as_mut_ptr());
-            tracing::trace!(
-                "GL viewport={vp:?} scissor_enabled={scissor_enabled} scissor={scissor:?}"
-            );
-            // ── Pass 1: BG quads ─────────────────────────────────────────────
+
             gl::UseProgram(self.bg_prog);
             gl::BindVertexArray(self.bg_vao);
             set_u2f(self.bg_prog, "u_vp", vw, vh);
@@ -1311,7 +1400,6 @@ impl ChromeRenderer {
                 gl::DrawArraysInstanced(gl::TRIANGLES, 0, 6, bg_cpu.len() as i32);
             }
 
-            // ── Pass 2: RoundRect (SDF) ───────────────────────────────────────
             gl::UseProgram(self.rrect_prog);
             gl::BindVertexArray(self.rrect_vao);
             set_u2f(self.rrect_prog, "u_vp", vw, vh);
@@ -1321,7 +1409,6 @@ impl ChromeRenderer {
                 gl::DrawArraysInstanced(gl::TRIANGLES, 0, 6, rrect_cpu.len() as i32);
             }
 
-            // ── Pass 3: Glyph quads ───────────────────────────────────────────
             gl::UseProgram(self.glyph_prog);
             gl::BindVertexArray(self.glyph_vao);
             set_u2f(self.glyph_prog, "u_vp", vw, vh);
@@ -1334,7 +1421,6 @@ impl ChromeRenderer {
                 gl::DrawArraysInstanced(gl::TRIANGLES, 0, 6, glyph_cpu.len() as i32);
             }
 
-            // ── Pass 4: Powerline triangles ───────────────────────────────────
             gl::UseProgram(self.tri_prog);
             set_u2f(self.tri_prog, "u_vp", vw, vh);
 
@@ -1356,8 +1442,6 @@ impl ChromeRenderer {
             gl::UseProgram(0);
         }
     }
-
-    // ── Text shaping ──────────────────────────────────────────────────────────
 
     fn shape_text_into(
         &mut self,
@@ -1395,7 +1479,13 @@ impl ChromeRenderer {
             if max_px.map_or(false, |m| px - x as f32 >= m) {
                 break;
             }
-            let adv = sg.cluster_width as f32 * cw_f;
+            // Use real HarfBuzz advance (design units → pixels).
+            // Fall back to cell-grid snap for zero-advance glyphs (combiners).
+            let adv = if sg.advance_px > 0.0 {
+                sg.advance_px * self.hb_scale
+            } else {
+                sg.cluster_width as f32 * cw_f
+            };
             if let Some(uv) = self
                 .atlas
                 .glyph_by_id(sg.glyph_id, style.bold, style.italic)
@@ -1410,9 +1500,11 @@ impl ChromeRenderer {
 
     #[inline]
     fn push_glyph(&self, uv: &GlyphUv, px: f32, py: f32, fg: [f32; 4], out: &mut Vec<GlyphInst>) {
-        let pad = self.atlas.cell_h.saturating_sub(self.atlas.natural_h) / 2;
+        // kitty: x = pen_x + bitmap_left,  y = baseline - bitmap_top
+        //        bearing_x = bitmap_left (px, pen→left edge)
+        //        bearing_y = bitmap_top  (px above baseline, positive up)
         let gx = px.round() + uv.bearing_x as f32;
-        let gy = py.round() + pad as f32 + (self.ascender - uv.bearing_y) as f32;
+        let gy = py.round() + self.ascender as f32 - uv.bearing_y as f32;
         out.push(GlyphInst {
             glyph: [gx, gy, uv.width as f32, uv.height as f32],
             uv: [uv.uv_x, uv.uv_y, uv.uv_x + uv.uv_w, uv.uv_y + uv.uv_h],
@@ -1432,7 +1524,7 @@ fn shape_run(
     max_w: Option<u32>,
     atlas: &mut GlyphAtlas,
     shaper: &Shaper,
-    _hb_scale: f32,
+    hb_scale: f32,
     cell_w: u32,
     out: &mut Vec<GlyphInst>,
 ) {
@@ -1443,19 +1535,21 @@ fn shape_run(
     let max_px = max_w.map(|m| m as f32);
     let cw_f = cell_w as f32;
     let mut px = x as f32;
-    let pad = atlas.cell_h.saturating_sub(atlas.natural_h) / 2;
     let ascender = atlas.ascender;
-    let shaped = shaper.shape(text);
 
-    for sg in &shaped {
+    for sg in shaper.shape(text) {
         if max_px.map_or(false, |m| px - x as f32 >= m) {
             break;
         }
-        let adv = sg.cluster_width as f32 * cw_f;
+        let adv = if sg.advance_px > 0.0 {
+            sg.advance_px * hb_scale
+        } else {
+            sg.cluster_width as f32 * cw_f
+        };
         if let Some(uv) = atlas.glyph_by_id(sg.glyph_id, style.bold, style.italic) {
             if uv.width > 0 {
                 let gx = px.round() + uv.bearing_x as f32;
-                let gy = y as f32 + pad as f32 + (ascender - uv.bearing_y) as f32;
+                let gy = y as f32 + ascender as f32 - uv.bearing_y as f32;
                 out.push(GlyphInst {
                     glyph: [gx, gy, uv.width as f32, uv.height as f32],
                     uv: [uv.uv_x, uv.uv_y, uv.uv_x + uv.uv_w, uv.uv_y + uv.uv_h],
@@ -1541,15 +1635,6 @@ unsafe fn create_bg_vao(prog: u32, cap: usize) -> (u32, u32) {
     (vao, ivbo)
 }
 
-/// RoundRect SDF VAO.
-///
-/// Instance layout mirrors `RRectInst` (96 bytes):
-///   offset  0 — rect    vec4
-///   offset 16 — radii   vec4
-///   offset 32 — fill    vec4
-///   offset 48 — stroke  vec4
-///   offset 64 — strokew f32
-///   offset 68 — pad     [f32; 3]
 unsafe fn create_rrect_vao(prog: u32, cap: usize) -> (u32, u32) {
     let (mut vao, mut qvbo, mut ivbo) = (0u32, 0u32, 0u32);
     gl::GenVertexArrays(1, &mut vao);
@@ -1578,7 +1663,6 @@ unsafe fn create_rrect_vao(prog: u32, cap: usize) -> (u32, u32) {
     inst_attr(prog, "i_radii", 4, 16, s);
     inst_attr(prog, "i_fill", 4, 32, s);
     inst_attr(prog, "i_stroke", 4, 48, s);
-    // i_strokew: single float at offset 64
     let loc = attr_loc(prog, "i_strokew");
     gl::EnableVertexAttribArray(loc);
     gl::VertexAttribPointer(loc, 1, gl::FLOAT, gl::FALSE, s, 64 as *const _);

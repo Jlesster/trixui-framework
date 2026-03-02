@@ -16,7 +16,6 @@ backend-smithay = ["dep:smithay"]       # ← rename this from backend-wayland
 # Core
 bitflags   = "2"
 tracing    = "0.1"
-ab_glyph   = "0.2"
 
 # Winit backend (default)
 winit             = { version = "0.30", optional = true }
@@ -29,10 +28,10 @@ smithay = { version = "0.3.0", optional = true, default-features = false, featur
     "wayland_frontend", "xwayland",
 ]}
 
-
 # GL loader (used by both backends)
-gl = "0.14"
+gl        = "0.14"
 rustybuzz = "0.20.1"
+freetype  = "0.7.2"   # servo/rust-freetype — raw FFI: freetype::freetype::FT_*
 
 [dev-dependencies]
 tracing-subscriber = "0.3"

@@ -45,22 +45,19 @@ pub(crate) type SpawnQueue<Msg> = Arc<std::sync::Mutex<std::collections::VecDequ
 // ── Frame ─────────────────────────────────────────────────────────────────────
 
 /// Render target passed to `App::view`.
-///
-/// Pixel-only — no cell grid concepts here. Font metrics (`glyph_w`, `line_h`)
-/// are available for chrome drawing; TUI widget cell sizing is handled inside
-/// the Widget trait call-site.
 pub struct Frame<'a> {
     canvas: &'a mut PixelCanvas,
     layout: ScreenLayout,
     theme: &'a Theme,
     /// Nominal glyph advance width in pixels (from the renderer font atlas).
-    /// Used by chrome drawing code to size borders and title padding.
     pub glyph_w: u32,
-    /// Font line height in pixels (from the renderer font atlas).
-    /// Used by chrome drawing code to vertically centre text in bars/borders.
+    /// Font line height in pixels (cell_h, includes atlas padding).
     pub line_h: u32,
-    /// TUI cell width — passed to Widget::render. Same value as glyph_w for
-    /// monospace fonts; kept separate so the two uses stay explicit.
+    /// Actual ink height of glyphs (ascent + |descent| + line_gap, no padding).
+    /// Use this for vertical centering — it avoids the off-by-a-few-pixels
+    /// shift that cell_h causes in bar_text_y.
+    pub natural_h: u32,
+    /// TUI cell width — passed to Widget::render.
     cell_w: u32,
     /// TUI cell height — passed to Widget::render.
     cell_h: u32,
@@ -75,6 +72,7 @@ impl<'a> Frame<'a> {
         theme: &'a Theme,
         glyph_w: u32,
         line_h: u32,
+        natural_h: u32,
     ) -> Self {
         Self {
             canvas,
@@ -82,19 +80,18 @@ impl<'a> Frame<'a> {
             theme,
             glyph_w,
             line_h,
-            // TUI cell dimensions are the same as glyph metrics for monospace.
+            natural_h,
             cell_w: glyph_w,
             cell_h: line_h,
             regions: Vec::new(),
         }
     }
 
-    /// Convenience constructor — equivalent to [`Frame::new_with_metrics`] but
-    /// with metrics inferred as `(0, 0)` for callers that don't need them.
+    /// Convenience constructor with metrics inferred as `(0, 0)`.
     ///
     /// Prefer [`Frame::new_with_metrics`] when font metrics are available.
     pub fn new(canvas: &'a mut PixelCanvas, layout: ScreenLayout, theme: &'a Theme) -> Self {
-        Self::new_with_metrics(canvas, layout, theme, 0, 0)
+        Self::new_with_metrics(canvas, layout, theme, 0, 0, 0)
     }
 
     // ── Area accessors ────────────────────────────────────────────────────────
@@ -114,27 +111,22 @@ impl<'a> Frame<'a> {
     pub fn theme(&self) -> &Theme {
         self.theme
     }
-    /// TUI cell width in pixels.
     pub fn cell_w(&self) -> u32 {
         self.cell_w
     }
-    /// TUI cell height in pixels.
     pub fn cell_h(&self) -> u32 {
         self.cell_h
     }
-    /// Raw canvas — use when you need direct `DrawCmd` control.
     pub fn canvas(&mut self) -> &mut PixelCanvas {
         self.canvas
     }
 
     // ── TUI widget render helpers ─────────────────────────────────────────────
 
-    /// Render any [`Widget`] into `area`.
     pub fn render(&mut self, widget: impl Widget, area: Rect) {
         widget.render(self.canvas, area, self.cell_w, self.cell_h, self.theme);
     }
 
-    /// Render a [`StatefulWidget`] into `area`.
     pub fn render_stateful<W: StatefulWidget>(
         &mut self,
         widget: W,
@@ -151,17 +143,12 @@ impl<'a> Frame<'a> {
         );
     }
 
-    /// Render a [`Block`], returning the inner content [`Rect`].
     pub fn render_block(&mut self, block: Block<'_>, area: Rect) -> Rect {
         block.render(self.canvas, area, self.cell_w, self.cell_h, self.theme)
     }
 
     // ── Chrome helpers ────────────────────────────────────────────────────────
 
-    /// Draw a pane border + title in one call.
-    ///
-    /// All font metrics are supplied implicitly from the renderer.
-    /// See [`PaneOpts`] for the builder API.
     pub fn draw_pane(&mut self, area: Rect, opts: PaneOpts) {
         draw_pane(
             self.canvas,
@@ -175,9 +162,17 @@ impl<'a> Frame<'a> {
 
     /// Begin building a status bar for `area`.
     ///
-    /// Chain `.left()`, `.center()`, `.right()`, then call `.finish()`.
+    /// Passes `natural_h` (not `line_h`) so that `bar_text_y` centers text
+    /// correctly against the actual ink height of glyphs.
     pub fn bar(&mut self, area: Rect) -> BarBuilder<'_> {
-        BarBuilder::new(self.canvas, area, self.theme, self.glyph_w, self.line_h)
+        BarBuilder::new(
+            self.canvas,
+            area,
+            self.theme,
+            self.glyph_w,
+            self.line_h,
+            self.natural_h,
+        )
     }
 
     // ── Hit region API ────────────────────────────────────────────────────────
@@ -266,12 +261,14 @@ impl<B: crate::backend::Backend> Terminal<B> {
 
             let (vp_w, vp_h) = self.backend.size();
             let (cell_w, cell_h) = self.backend.cell_size();
+            let natural_h = self.backend.natural_h();
             let theme = app.theme();
             let sl = ScreenLayout::new(vp_w, vp_h, 0);
             let mut canvas = PixelCanvas::new(vp_w, vp_h);
             canvas.set_clip(Some(sl.vp));
             {
-                let mut frame = Frame::new_with_metrics(&mut canvas, sl, &theme, cell_w, cell_h);
+                let mut frame =
+                    Frame::new_with_metrics(&mut canvas, sl, &theme, cell_w, cell_h, natural_h);
                 app.view(&mut frame);
             }
             let cmds = canvas.finish();

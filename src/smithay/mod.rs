@@ -1,68 +1,4 @@
 //! smithay — plug-and-play compositor chrome driver.
-//!
-//! # Minimal integration (5 lines)
-//!
-//! ```rust,no_run
-//! use trixui::smithay::SmithayApp;
-//! use trixui::prelude::*;
-//!
-//! struct MyChrome;
-//! impl App for MyChrome {
-//!     type Message = ();
-//!     fn update(&mut self, _: Event<()>) -> Cmd<()> { Cmd::none() }
-//!     fn view(&self, _: &mut Frame) {}
-//! }
-//!
-//! // After your GL context is current:
-//! let mut ui = SmithayApp::builder(MyChrome)
-//!     .viewport(1920, 1080)
-//!     .build()?;
-//!
-//! // Each DRM frame:
-//! ui.render(); // → flushes DrawCmds into the bound FBO
-//!
-//! // Input:
-//! ui.push_key(KeyEvent::plain(KeyCode::Char('j')));
-//!
-//! // Resize:
-//! ui.resize(2560, 1440);
-//!
-//! // Hit-test for compositor routing:
-//! if let Some(region) = ui.hit_test(x, y) {
-//!     // "titlebar", "close_btn", etc.
-//! }
-//! ```
-//!
-//! ## Two-phase workflow (explicit-sync / multi-GPU)
-//!
-//! ```rust,no_run
-//! // CPU phase — safe before FBO bind:
-//! let cmds = ui.collect();
-//!
-//! // GPU phase — inside DRM render callback:
-//! if ui.needs_flush() {
-//!     ui.flush_collected(cmds);
-//! }
-//! ```
-//!
-//! ## Compositor input routing
-//!
-//! ```rust,no_run
-//! // Deliver keyboard events only when chrome has focus:
-//! match your_compositor.focused_surface() {
-//!     FocusTarget::Chrome => ui.push_key(key),
-//!     FocusTarget::Client(id) => client_map[id].push_key(key),
-//! }
-//!
-//! // Mouse hit-test:
-//! if let Some(region) = ui.hit_test(ptr_x, ptr_y) {
-//!     match region {
-//!         "titlebar" => /* start move */,
-//!         "close_btn" => /* close window */,
-//!         _ => {}
-//!     }
-//! }
-//! ```
 
 use std::sync::Arc;
 
@@ -77,8 +13,6 @@ use crate::renderer::{
     DrawCmd, PixelCanvas,
 };
 
-// ── Default embedded font ─────────────────────────────────────────────────────
-
 const DEFAULT_FONT: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/assets/IosevkaJlessBrainsNerdFontNerdFont-Regular.ttf"
@@ -87,7 +21,6 @@ const DEFAULT_FONT_SIZE: f32 = 20.0;
 
 // ── FontConfig ────────────────────────────────────────────────────────────────
 
-/// Font configuration for [`SmithayApp`].
 #[derive(Clone)]
 pub struct FontConfig {
     pub regular: Arc<[u8]>,
@@ -123,7 +56,6 @@ impl Default for FontConfig {
 
 // ── Builder ───────────────────────────────────────────────────────────────────
 
-/// Builder for [`SmithayApp`]. Obtain via [`SmithayApp::builder`].
 pub struct SmithayAppBuilder<A: App> {
     app: A,
     font: FontConfig,
@@ -143,28 +75,23 @@ impl<A: App> SmithayAppBuilder<A> {
         }
     }
 
-    /// Use a custom font file.
     pub fn font(mut self, data: impl Into<Arc<[u8]>>, size_px: f32) -> Self {
         self.font = FontConfig::new(data, size_px);
         self
     }
-    /// Supply a full [`FontConfig`] (bold/italic variants + size).
     pub fn font_config(mut self, cfg: FontConfig) -> Self {
         self.font = cfg;
         self
     }
-    /// Initial viewport dimensions in physical pixels.
     pub fn viewport(mut self, w: u32, h: u32) -> Self {
         self.vp_w = w;
         self.vp_h = h;
         self
     }
-    /// Reserve this many **exact pixels** at the bottom for a status bar.
     pub fn bar_height_px(mut self, h: u32) -> Self {
         self.bar_h_px = h;
         self
     }
-    /// Build. Requires a current GL context.
     pub fn build(self) -> crate::Result<SmithayApp<A>> {
         SmithayApp::from_builder(self)
     }
@@ -172,9 +99,6 @@ impl<A: App> SmithayAppBuilder<A> {
 
 // ── SmithayApp ────────────────────────────────────────────────────────────────
 
-/// Self-contained chrome renderer for a Smithay compositor.
-///
-/// See the [module docs](self) for a minimal integration example.
 pub struct SmithayApp<A: App> {
     renderer: ChromeRenderer,
     app: A,
@@ -185,21 +109,15 @@ pub struct SmithayApp<A: App> {
     pending_mouse: std::collections::VecDeque<MouseEvent>,
     dirty: bool,
     last_cmds: Vec<DrawCmd>,
-    /// Hit regions from the last rendered frame.
     last_regions: Vec<(String, Rect)>,
-    /// Spawn queue for background tasks (Cmd::Spawn).
     spawn_queue: SpawnQueue<A::Message>,
 }
 
 impl<A: App> SmithayApp<A> {
-    // ── Construction ──────────────────────────────────────────────────────────
-
-    /// Start building. Call `.build()` once the GL context is current.
     pub fn builder(app: A) -> SmithayAppBuilder<A> {
         SmithayAppBuilder::new(app)
     }
 
-    /// Convenience constructor using the default embedded font.
     pub fn new(app: A, vp_w: u32, vp_h: u32) -> crate::Result<Self> {
         SmithayApp::builder(app).viewport(vp_w, vp_h).build()
     }
@@ -224,7 +142,6 @@ impl<A: App> SmithayApp<A> {
             Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
 
         let mut app = b.app;
-        // Correctly process init Cmd — including Quit and Msg variants.
         let init_cmd = app.init();
         process_cmd_tree(init_cmd, &mut app, &spawn_queue);
 
@@ -245,40 +162,34 @@ impl<A: App> SmithayApp<A> {
 
     // ── Input ─────────────────────────────────────────────────────────────────
 
-    /// Enqueue a key event to be processed on the next frame.
     pub fn push_key(&mut self, ev: KeyEvent) {
         self.pending_keys.push_back(ev);
         self.dirty = true;
     }
 
-    /// Enqueue a mouse event to be processed on the next frame.
     pub fn push_mouse(&mut self, ev: MouseEvent) {
         self.pending_mouse.push_back(ev);
         self.dirty = true;
     }
 
-    /// Notify that the compositor surface gained keyboard focus.
     pub fn focus_gained(&mut self) {
         let cmd = self.app.update(Event::FocusGained);
         process_cmd_tree(cmd, &mut self.app, &self.spawn_queue.clone());
         self.dirty = true;
     }
 
-    /// Notify that the compositor surface lost keyboard focus.
     pub fn focus_lost(&mut self) {
         let cmd = self.app.update(Event::FocusLost);
         process_cmd_tree(cmd, &mut self.app, &self.spawn_queue.clone());
         self.dirty = true;
     }
 
-    /// Deliver a scroll delta (logical pixels). Positive Y = scroll down.
     pub fn push_scroll(&mut self, x: f32, y: f32) {
         let cmd = self.app.update(Event::Scroll { x, y });
         process_cmd_tree(cmd, &mut self.app, &self.spawn_queue.clone());
         self.dirty = true;
     }
 
-    /// Deliver a typed application message directly (bypasses the event queue).
     pub fn send(&mut self, msg: A::Message) {
         let cmd = self.app.update(Event::Message(msg));
         process_cmd_tree(cmd, &mut self.app, &self.spawn_queue.clone());
@@ -287,7 +198,6 @@ impl<A: App> SmithayApp<A> {
 
     // ── Geometry ──────────────────────────────────────────────────────────────
 
-    /// Notify of a viewport resize.
     pub fn resize(&mut self, w: u32, h: u32) {
         if self.vp_w == w && self.vp_h == h {
             return;
@@ -299,7 +209,6 @@ impl<A: App> SmithayApp<A> {
         self.dirty = true;
     }
 
-    /// Update the status-bar height (exact pixels, no cell-quantisation).
     pub fn set_bar_height_px(&mut self, h: u32) {
         if self.bar_h_px == h {
             return;
@@ -308,8 +217,6 @@ impl<A: App> SmithayApp<A> {
         self.dirty = true;
     }
 
-    /// Returns true if there's pending work (dirty state, queued events, or
-    /// pending spawn results).
     pub fn needs_flush(&self) -> bool {
         self.dirty
             || !self.pending_keys.is_empty()
@@ -317,54 +224,32 @@ impl<A: App> SmithayApp<A> {
             || self.spawn_queue.lock().map_or(false, |g| !g.is_empty())
     }
 
-    /// The current [`ScreenLayout`] (recalculated without re-rendering).
     pub fn layout(&self) -> ScreenLayout {
         ScreenLayout::new(self.vp_w, self.vp_h, self.bar_h_px)
     }
 
-    /// Raw font glyph advance width from the renderer (pixels).
     pub fn glyph_w(&self) -> u32 {
         self.renderer.cell_w
     }
-    /// Raw font line height from the renderer (pixels).
     pub fn line_h(&self) -> u32 {
         self.renderer.cell_h
+    }
+    pub fn natural_h(&self) -> u32 {
+        self.renderer.natural_h
     }
 
     // ── Hit-test ──────────────────────────────────────────────────────────────
 
-    /// Test a physical-pixel coordinate against regions registered during the
-    /// last `render()` / `collect()` call.
-    ///
-    /// Returns the name of the hit region (e.g. `"titlebar"`, `"close_btn"`),
-    /// or `None` if outside all registered regions.
-    ///
-    /// ```rust,ignore
-    /// // In your compositor pointer-motion handler:
-    /// match ui.hit_test(ptr_x, ptr_y) {
-    ///     Some("titlebar")  => start_interactive_move(),
-    ///     Some("close_btn") => close_window(),
-    ///     _                 => forward_to_client(),
-    /// }
-    /// ```
     pub fn hit_test(&self, x: u32, y: u32) -> Option<&str> {
         Frame::hit_test_regions(&self.last_regions, x, y)
     }
 
-    /// Access the last rendered hit regions directly (for custom routing).
     pub fn regions(&self) -> &[(String, Rect)] {
         &self.last_regions
     }
 
     // ── Render API ────────────────────────────────────────────────────────────
 
-    /// **Primary entry-point.**
-    ///
-    /// Processes all pending input and spawn results, ticks the app, renders
-    /// the view, and flushes draw commands into the currently-bound FBO.
-    ///
-    /// Skips the GL flush if nothing changed (damage tracking).
-    /// Returns `true` if a GPU flush was performed.
     pub fn render(&mut self) -> bool {
         let (cmds, regions) = self.collect_inner();
         if cmds_equal(&self.last_cmds, &cmds) && !self.dirty {
@@ -377,13 +262,6 @@ impl<A: App> SmithayApp<A> {
         true
     }
 
-    // ── Two-phase API ─────────────────────────────────────────────────────────
-
-    /// **Phase 1 — CPU only.** Process events + tick + build draw list.
-    ///
-    /// Safe to call before the DRM render pass / FBO bind. Does not touch GL.
-    /// After this call, [`needs_flush`](Self::needs_flush) indicates whether
-    /// the draw list changed.
     pub fn collect(&mut self) -> Vec<DrawCmd> {
         let (cmds, regions) = self.collect_inner();
         if cmds_equal(&self.last_cmds, &cmds) {
@@ -393,7 +271,6 @@ impl<A: App> SmithayApp<A> {
         cmds
     }
 
-    /// **Phase 2 — GL.** Flush previously collected commands into the bound FBO.
     pub fn flush_collected(&mut self, cmds: Vec<DrawCmd>) {
         self.flush_inner(&cmds);
         self.last_cmds = cmds;
@@ -403,11 +280,9 @@ impl<A: App> SmithayApp<A> {
     // ── Internal ──────────────────────────────────────────────────────────────
 
     fn collect_inner(&mut self) -> (Vec<DrawCmd>, Vec<(String, Rect)>) {
-        // Drain spawn queue first (results from background tasks).
         let sq = self.spawn_queue.clone();
         drain_spawn(&sq, &mut self.app);
 
-        // Drain pending events.
         while let Some(k) = self.pending_keys.pop_front() {
             let cmd = self.app.update(Event::Key(k));
             process_cmd_tree(cmd, &mut self.app, &self.spawn_queue);
@@ -417,7 +292,6 @@ impl<A: App> SmithayApp<A> {
             process_cmd_tree(cmd, &mut self.app, &self.spawn_queue);
         }
 
-        // Tick.
         let cmd = self.app.update(Event::Tick);
         process_cmd_tree(cmd, &mut self.app, &self.spawn_queue);
 
@@ -434,8 +308,9 @@ impl<A: App> SmithayApp<A> {
                 &mut canvas,
                 sl,
                 &theme,
-                self.renderer.cell_w, // glyph_w
-                self.renderer.cell_h, // line_h
+                self.renderer.cell_w,
+                self.renderer.cell_h,
+                self.renderer.natural_h, // ← pass natural_h for correct bar centering
             );
             self.app.view(&mut frame);
             frame.into_regions()
@@ -457,8 +332,6 @@ impl<A: App> SmithayApp<A> {
 
 // ── Damage detection ──────────────────────────────────────────────────────────
 
-/// Returns `true` when the two draw-command lists are structurally identical.
-/// Named correctly: `cmds_equal` (previously the naming was inverted).
 fn cmds_equal(prev: &[DrawCmd], next: &[DrawCmd]) -> bool {
     if prev.len() != next.len() {
         return false;
@@ -485,6 +358,7 @@ fn drawcmd_eq(a: &DrawCmd, b: &DrawCmd) -> bool {
                 color: c2,
             },
         ) => x1 == x2 && y1 == y2 && w1 == w2 && h1 == h2 && c1 == c2,
+
         (
             StrokeRect {
                 x: x1,
@@ -501,6 +375,7 @@ fn drawcmd_eq(a: &DrawCmd, b: &DrawCmd) -> bool {
                 color: c2,
             },
         ) => x1 == x2 && y1 == y2 && w1 == w2 && h1 == h2 && c1 == c2,
+
         (
             HLine {
                 x: x1,
@@ -515,6 +390,7 @@ fn drawcmd_eq(a: &DrawCmd, b: &DrawCmd) -> bool {
                 color: c2,
             },
         ) => x1 == x2 && y1 == y2 && w1 == w2 && c1 == c2,
+
         (
             VLine {
                 x: x1,
@@ -529,6 +405,7 @@ fn drawcmd_eq(a: &DrawCmd, b: &DrawCmd) -> bool {
                 color: c2,
             },
         ) => x1 == x2 && y1 == y2 && h1 == h2 && c1 == c2,
+
         (
             BorderLine {
                 x: x1,
@@ -549,6 +426,7 @@ fn drawcmd_eq(a: &DrawCmd, b: &DrawCmd) -> bool {
                 thickness: t2,
             },
         ) => x1 == x2 && y1 == y2 && w1 == w2 && h1 == h2 && s1 == s2 && c1 == c2 && t1 == t2,
+
         (
             RoundRect {
                 x: x1,
@@ -580,6 +458,7 @@ fn drawcmd_eq(a: &DrawCmd, b: &DrawCmd) -> bool {
                 && s1 == s2
                 && sw1 == sw2
         }
+
         (
             PowerlineArrow {
                 x: x1,
@@ -598,6 +477,7 @@ fn drawcmd_eq(a: &DrawCmd, b: &DrawCmd) -> bool {
                 color: c2,
             },
         ) => x1 == x2 && y1 == y2 && w1 == w2 && h1 == h2 && d1 == d2 && c1 == c2,
+
         (
             Text {
                 x: x1,
@@ -623,6 +503,7 @@ fn drawcmd_eq(a: &DrawCmd, b: &DrawCmd) -> bool {
                 && s1.italic == s2.italic
                 && m1 == m2
         }
+
         _ => false,
     }
 }

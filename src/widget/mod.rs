@@ -150,8 +150,8 @@ pub trait StatefulWidget {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 #[inline]
-pub fn bar_text_y(inner: Rect, cell_h: u32) -> u32 {
-    inner.y + (inner.h.saturating_sub(cell_h) / 2)
+pub fn bar_text_y(inner: Rect, natural_h: u32) -> u32 {
+    inner.y + (inner.h.saturating_sub(natural_h) / 2)
 }
 
 #[inline]
