@@ -717,12 +717,11 @@ impl GlyphAtlas {
                 self.pixels[base + 3] = a;
             }
         }
-        let inset = 0.5 / ATLAS_DIM as f32;
         let uv = GlyphUv {
-            uv_x: self.cursor_x as f32 / ATLAS_DIM as f32 + inset,
-            uv_y: self.cursor_y as f32 / ATLAS_DIM as f32 + inset,
-            uv_w: w as f32 / ATLAS_DIM as f32 - 2.0 * inset,
-            uv_h: h as f32 / ATLAS_DIM as f32 - 2.0 * inset,
+            uv_x: self.cursor_x as f32 / ATLAS_DIM as f32,
+            uv_y: self.cursor_y as f32 / ATLAS_DIM as f32,
+            uv_w: w as f32 / ATLAS_DIM as f32,
+            uv_h: h as f32 / ATLAS_DIM as f32,
             width: w,
             height: h,
             bearing_x,

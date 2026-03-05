@@ -29,7 +29,7 @@ impl App for Counter {
 
     fn view(&self, frame: &mut Frame) {
         // Extract all immutable data before taking the mutable canvas borrow.
-        let t = frame.theme().clone();
+        let t = *frame.theme();
         let area = frame.area();
         let cw = frame.cell_w();
         let ch = frame.cell_h();

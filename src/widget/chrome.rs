@@ -374,14 +374,14 @@ impl<'a> SectionBuilder<'a> {
     /// Clock as a bold accent-filled pill (right-section default).
     pub fn clock(self, time: impl Into<String>) -> Self {
         let t = self.theme;
-        let text = format!("  {} ", time.into());
+        let text = format!(" {} ", time.into());
         self.item(BarItem::pill(text, t.ws_active_fg, t.ws_active_bg, 0).bold(true))
     }
 
     /// Clock as plain dim text (no fill).
     pub fn clock_plain(self, time: impl Into<String>) -> Self {
         let fg = self.theme.bar_dim;
-        let text = format!("  {} ", time.into());
+        let text = format!(" {} ", time.into());
         self.item(BarItem::text(text).fg(fg))
     }
 
@@ -553,7 +553,12 @@ pub fn draw_bar(
     if rect.is_empty() {
         return;
     }
-
+    let right_w: u32 = right.iter().map(|i| i.width(glyph_w)).sum();
+    let center_w: u32 = center.iter().map(|i| i.width(glyph_w)).sum();
+    eprintln!(
+        "draw_bar: rect={:?} center_w={} right_w={}",
+        rect, center_w, right_w
+    );
     let bg = if bg_override.is_transparent() {
         theme.bar_bg
     } else {
